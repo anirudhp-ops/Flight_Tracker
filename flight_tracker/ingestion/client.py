@@ -80,7 +80,7 @@ def _raw_flight_to_event(raw: dict[str, Any], captured_at: datetime) -> FlightEv
             origin=raw.get("origin", {}).get("code_icao", ""),
             destination=raw.get("destination", {}).get("code_icao", ""),
             aircraft_id=raw.get("registration"),
-            gate_id=f"{raw.get('terminal_origin', '')}-{raw.get('gate_origin', '')}".strip("-"),
+            gate_id=f"{raw.get('terminal_origin', '')}-{raw.get('gate_origin', '')}".strip("-") or None,
             scheduled_departure=scheduled_out,
             estimated_departure=estimated_out,
             actual_departure=actual_out,
