@@ -39,6 +39,7 @@ class GraphEngine:
                     overlaps = not (a_arr < b_dep or b_arr < a_dep)
                     if overlaps:
                          self.graph.add_edge(node_key, new_flight.flight_key, type="gate_reuse")
+    
     async def load_from_db(self, pool) -> None:
         async with pool.acquire() as conn:
             rows = await conn.fetch("SELECT * FROM active_flights")
@@ -66,7 +67,6 @@ class GraphEngine:
                 self.add_flight(event)
                 self.add_edges_for_flight(event)
 
-                        
-    
-                    
-                    
+    def process_event(self, event: FlightEvent) -> None:
+        self.add_flight(event)
+        self.add_edges_for_flight(event)
