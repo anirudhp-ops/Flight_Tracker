@@ -24,13 +24,49 @@ class GraphEngine:
             if node_key == new_flight.flight_key:
                 continue
 
-        # aircraft_turn: same physical plane
+            # aircraft_turn: same physical plane
             if attrs["aircraft_id"] and new_flight.aircraft_id:
                 if attrs["aircraft_id"] == new_flight.aircraft_id:
                     self.graph.add_edge(node_key, new_flight.flight_key, type="aircraft_turn")
 
-        # gate_reuse: same gate, overlapping time windows
+            # gate_reuse: same gate, overlapping time windows
             if attrs["gate_id"] and new_flight.gate_id:
                 if attrs["gate_id"] == new_flight.gate_id:
-                    self.graph.add_edge(node_key, new_flight.flight_key, type="gate_reuse")
+                    a_dep = attrs["scheduled_departure"]
+                    a_arr = attrs["scheduled_arrival"]
+                    b_dep = new_flight.scheduled_departure
+                    b_arr = new_flight.scheduled_arrival
+                    overlaps = not (a_arr < b_dep or b_arr < a_dep)
+                    if overlaps:
+                         self.graph.add_edge(node_key, new_flight.flight_key, type="gate_reuse")
+    async def load_from_db(self, pool) -> None:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM active_flights")
+            for row in rows:
+                event = FlightEvent(
+                    flight_id=row["flight_id"],
+                    event_type=EventType(row["event_type"]),
+                    airline_code=row["airline_code"],
+                    flight_number=row["flight_number"],
+                    origin=row["origin"],
+                    destination=row["destination"],
+                    aircraft_id=row["aircraft_id"],
+                    gate_id=row["gate_id"],
+                    scheduled_departure=row["scheduled_departure"],
+                    estimated_departure=row["estimated_departure"],
+                    actual_departure=row["actual_departure"],
+                    scheduled_arrival=row["scheduled_arrival"],
+                    estimated_arrival=row["estimated_arrival"],
+                    actual_arrival=row["actual_arrival"],
+                    delay_minutes=row["delay_minutes"],
+                    status=FlightStatus(row["status"]),
+                    passenger_count=row["passenger_count"],
+                    timestamp=row["timestamp"],
+                )
+                self.add_flight(event)
+                self.add_edges_for_flight(event)
+
+                        
+    
+                    
                     
