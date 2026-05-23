@@ -1,5 +1,6 @@
 import networkx as nx
 from flight_tracker.models.events import FlightEvent
+from collections import deque
 
 
 class GraphEngine:
@@ -70,3 +71,25 @@ class GraphEngine:
     def process_event(self, event: FlightEvent) -> None:
         self.add_flight(event)
         self.add_edges_for_flight(event)
+    
+
+    def propagate_delay(self, flight_key: str, delay_minutes: int) -> None:
+        queue = deque()
+        queue.append((flight_key, delay_minutes))
+        visited = set()
+
+        while queue:
+            current_key, current_delay = queue.popleft()
+            if current_key in visited:
+                continue
+            visited.add(current_key)
+
+            for neighbor_key in self.graph.neighbors(current_key):
+                if neighbor_key in visited:
+                    continue
+                neighbor_delay = self.graph.nodes[neighbor_key]["delay_minutes"]
+                propagated = int(current_delay * 0.75)
+                new_delay = max(neighbor_delay, propagated)
+                self.graph.nodes[neighbor_key]["delay_minutes"] = new_delay
+                queue.append((neighbor_key, new_delay))
+                
