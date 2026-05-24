@@ -5,6 +5,7 @@ from flight_tracker.graph.engine import GraphEngine
 from flight_tracker.ingestion.worker import run as worker_run
 from flight_tracker.ingestion.publisher import RedisPublisher
 from flight_tracker.ingestion.client import MockFlightAwareClient
+from flight_tracker.models.events import FlightEvent
 
 app = FastAPI()
 graph_engine = GraphEngine()
@@ -26,6 +27,11 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
     try:
         async for message in pubsub.listen():
             if message["type"] == "message":
+                event = FlightEvent.model_validate_json(message["data"])
+                if event.delay_minutes > 0:
+                    graph_engine.propagate_delay(event.flight_key, event.delay_minutes)
                 await websocket.send_text(message["data"])
     except WebSocketDisconnect:
         await pubsub.unsubscribe(f"flights:{airport_code}")
+        
+        
