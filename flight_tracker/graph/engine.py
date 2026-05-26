@@ -93,3 +93,40 @@ class GraphEngine:
                 self.graph.nodes[neighbor_key]["delay_minutes"] = new_delay
                 queue.append((neighbor_key, new_delay))
                 
+    def resolve_gate_conflicts(self) -> list[dict]:
+        gate_pool = [f"{terminal}{num}" for terminal in ["A","B","C","T"] for num in range(1,15)]
+        used_gates = {attrs["gate_id"] for _, attrs in self.graph.nodes(data=True) if attrs["gate_id"]}
+        reassignments = []
+
+        for src, dst, data in self.graph.edges(data=True):
+            if data.get("type") != "gate_reuse":
+                continue
+
+            src_attrs = self.graph.nodes[src]
+            dst_attrs = self.graph.nodes[dst]
+
+            a_dep = src_attrs["scheduled_departure"]
+            a_arr = src_attrs["scheduled_arrival"]
+            b_dep = dst_attrs["scheduled_departure"]
+            b_arr = dst_attrs["scheduled_arrival"]
+            overlaps = not (a_arr < b_dep or b_arr < a_dep)
+
+            if not overlaps:
+                continue
+
+            free_gates = [g for g in gate_pool if g not in used_gates]
+            if not free_gates:
+                continue
+
+            new_gate = free_gates[0]
+            used_gates.add(new_gate)
+            self.graph.nodes[dst]["gate_id"] = new_gate
+            self.graph.remove_edge(src, dst)
+
+            reassignments.append({
+                "flight_key": dst,
+                "old_gate": dst_attrs["gate_id"],
+                "new_gate": new_gate,
+            })
+
+        return reassignments            
