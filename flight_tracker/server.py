@@ -40,3 +40,34 @@ async def startup():
     asyncio.create_task(worker_run(client, publisher, "JFK"))
 
 
+@app.websocket("/ws/{airport_code}")
+async def websocket_endpoint(websocket: WebSocket, airport_code: str):
+    await websocket.accept()
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe(f"flights:{airport_code}")
+    try:
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                event = FlightEvent.model_validate_json(message["data"])
+
+                if event.delay_minutes > 0:
+                    predicted = predictor.predict(
+                        airline_code=event.airline_code,
+                        origin=event.origin,
+                        destination=event.destination,
+                        dep_delay=event.delay_minutes,
+                        air_time=0,
+                        distance=0,
+                    )
+                    graph_engine.propagate_delay(event.flight_key, event.delay_minutes)
+                    print(f"{event.flight_key} — predicted arrival delay: {predicted:.1f} min")
+
+                # resolve any gate conflicts after propagation
+                reassignments = graph_engine.resolve_gate_conflicts()
+                if reassignments:
+                    print(f"Gate reassignments: {reassignments}")
+
+                await websocket.send_text(message["data"])
+
+    except WebSocketDisconnect:
+        await pubsub.unsubscribe(f"flights:{airport_code}")
