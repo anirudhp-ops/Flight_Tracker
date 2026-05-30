@@ -69,5 +69,4 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
 
                 await websocket.send_text(message["data"])
 
-    except WebSocketDisconnect:
-        await pubsub.unsubscribe(f"flights:{airport_code}")
+    
