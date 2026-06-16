@@ -3,14 +3,64 @@ import * as d3 from "d3";
 import * as topojson from "topojson-client";
 
 const airports = {
-  JFK:{lat:40.64,lon:-73.78},LAX:{lat:33.94,lon:-118.41},ORD:{lat:41.97,lon:-87.91},
-  ATL:{lat:33.64,lon:-84.43},BOS:{lat:42.36,lon:-71.01},SFO:{lat:37.62,lon:-122.38},
-  DEN:{lat:39.86,lon:-104.67},FLL:{lat:26.07,lon:-80.15},MCO:{lat:28.43,lon:-81.31},
-  MIA:{lat:25.79,lon:-80.29},SEA:{lat:47.45,lon:-122.31},IAH:{lat:29.98,lon:-95.34},
-  SJU:{lat:18.44,lon:-66.00},LHR:{lat:51.47,lon:-0.46},NRT:{lat:35.77,lon:140.39},
-  DFW:{lat:32.90,lon:-97.04},LAS:{lat:36.08,lon:-115.15},
-  SMF:{lat:38.70,lon:-121.59},ONT:{lat:34.06,lon:-117.60},SBA:{lat:34.43,lon:-119.84},
-  PHX:{lat:33.44,lon:-112.01},PDX:{lat:45.59,lon:-122.60},CDG:{lat:49.01,lon:2.55},
+  // ── US West Coast ──
+  SFO:{lat:37.62,lon:-122.38},LAX:{lat:33.94,lon:-118.41},SEA:{lat:47.45,lon:-122.31},
+  PDX:{lat:45.59,lon:-122.60},LAS:{lat:36.08,lon:-115.15},PHX:{lat:33.44,lon:-112.01},
+  SAN:{lat:32.73,lon:-117.19},SJC:{lat:37.36,lon:-121.93},OAK:{lat:37.72,lon:-122.22},
+  SMF:{lat:38.70,lon:-121.59},BUR:{lat:34.20,lon:-118.36},LGB:{lat:33.82,lon:-118.15},
+  SNA:{lat:33.68,lon:-117.87},ONT:{lat:34.06,lon:-117.60},SBA:{lat:34.43,lon:-119.84},
+  SBP:{lat:35.24,lon:-120.64},FAT:{lat:36.78,lon:-119.72},RNO:{lat:39.50,lon:-119.77},
+  // ── US Mountain ──
+  DEN:{lat:39.86,lon:-104.67},SLC:{lat:40.79,lon:-111.98},ABQ:{lat:35.04,lon:-106.61},
+  ELP:{lat:31.81,lon:-106.38},BOI:{lat:43.56,lon:-116.22},TUS:{lat:32.12,lon:-110.94},
+  // ── US Southwest / Texas ──
+  DFW:{lat:32.90,lon:-97.04},IAH:{lat:29.98,lon:-95.34},HOU:{lat:29.65,lon:-95.28},
+  SAT:{lat:29.53,lon:-98.47},AUS:{lat:30.20,lon:-97.67},DAL:{lat:32.85,lon:-96.85},
+  // ── US Midwest ──
+  ORD:{lat:41.97,lon:-87.91},MDW:{lat:41.79,lon:-87.74},DTW:{lat:42.21,lon:-83.35},
+  MSP:{lat:44.88,lon:-93.22},STL:{lat:38.75,lon:-90.37},MKE:{lat:42.95,lon:-87.90},
+  CLE:{lat:41.41,lon:-81.85},CMH:{lat:39.99,lon:-82.89},IND:{lat:39.72,lon:-86.29},
+  CVG:{lat:39.05,lon:-84.67},MSN:{lat:43.14,lon:-89.34},OMA:{lat:41.30,lon:-95.90},
+  DSM:{lat:41.53,lon:-93.66},MCI:{lat:39.30,lon:-94.71},
+  // ── US Southeast ──
+  ATL:{lat:33.64,lon:-84.43},MIA:{lat:25.79,lon:-80.29},FLL:{lat:26.07,lon:-80.15},
+  MCO:{lat:28.43,lon:-81.31},TPA:{lat:27.98,lon:-82.53},JAX:{lat:30.49,lon:-81.69},
+  PBI:{lat:26.68,lon:-80.10},RSW:{lat:26.54,lon:-81.76},SRQ:{lat:27.40,lon:-82.55},
+  BNA:{lat:36.12,lon:-86.68},MEM:{lat:35.04,lon:-89.98},BHM:{lat:33.56,lon:-86.75},
+  MSY:{lat:29.99,lon:-90.26},LIT:{lat:34.73,lon:-92.22},CHS:{lat:32.90,lon:-80.04},
+  RDU:{lat:35.88,lon:-78.79},CLT:{lat:35.21,lon:-80.94},GSO:{lat:36.10,lon:-79.94},
+  // ── US Northeast ──
+  JFK:{lat:40.64,lon:-73.78},LGA:{lat:40.78,lon:-73.87},EWR:{lat:40.69,lon:-74.17},
+  BOS:{lat:42.36,lon:-71.01},PHL:{lat:39.87,lon:-75.24},DCA:{lat:38.85,lon:-77.04},
+  IAD:{lat:38.94,lon:-77.45},BWI:{lat:39.18,lon:-76.67},PIT:{lat:40.49,lon:-80.23},
+  BDL:{lat:41.94,lon:-72.68},MHT:{lat:42.93,lon:-71.44},PVD:{lat:41.73,lon:-71.43},
+  SYR:{lat:43.11,lon:-76.11},ALB:{lat:42.75,lon:-73.80},BUF:{lat:42.94,lon:-78.73},
+  ROC:{lat:43.12,lon:-77.67},ORF:{lat:36.90,lon:-76.02},RIC:{lat:37.50,lon:-77.32},
+  // ── US Alaska / Hawaii ──
+  ANC:{lat:61.17,lon:-150.00},FAI:{lat:64.82,lon:-147.86},
+  HNL:{lat:21.33,lon:-157.92},OGG:{lat:20.90,lon:-156.43},KOA:{lat:19.74,lon:-156.04},
+  LIH:{lat:21.98,lon:-159.34},ITO:{lat:19.72,lon:-155.05},
+  // ── Caribbean / Latin America ──
+  SJU:{lat:18.44,lon:-66.00},CUN:{lat:21.04,lon:-86.87},MEX:{lat:19.44,lon:-99.07},
+  GDL:{lat:20.52,lon:-103.31},MTY:{lat:25.78,lon:-100.11},BOG:{lat:4.70,lon:-74.15},
+  GRU:{lat:-23.43,lon:-46.47},EZE:{lat:-34.82,lon:-58.54},LIM:{lat:-12.02,lon:-77.11},
+  SCL:{lat:-33.39,lon:-70.79},PTY:{lat:9.07,lon:-79.38},
+  // ── Europe ──
+  LHR:{lat:51.47,lon:-0.46},CDG:{lat:49.01,lon:2.55},FRA:{lat:50.04,lon:8.56},
+  AMS:{lat:52.31,lon:4.77},MAD:{lat:40.47,lon:-3.56},FCO:{lat:41.80,lon:12.24},
+  ZRH:{lat:47.46,lon:8.55},MUC:{lat:48.35,lon:11.79},VIE:{lat:48.11,lon:16.57},
+  BRU:{lat:50.90,lon:4.48},CPH:{lat:55.63,lon:12.66},HEL:{lat:60.32,lon:24.96},
+  ARN:{lat:59.65,lon:17.92},OSL:{lat:60.20,lon:11.08},LIS:{lat:38.78,lon:-9.14},
+  DUB:{lat:53.42,lon:-6.27},MAN:{lat:53.35,lon:-2.27},
+  // ── Asia Pacific ──
+  NRT:{lat:35.77,lon:140.39},HND:{lat:35.55,lon:139.78},ICN:{lat:37.46,lon:126.44},
+  PEK:{lat:40.08,lon:116.58},PVG:{lat:31.14,lon:121.80},HKG:{lat:22.31,lon:113.91},
+  SIN:{lat:1.36,lon:103.99},BKK:{lat:13.69,lon:100.75},KUL:{lat:2.75,lon:101.71},
+  SYD:{lat:-33.95,lon:151.18},MEL:{lat:-37.67,lon:144.84},AKL:{lat:-37.01,lon:174.79},
+  DEL:{lat:28.57,lon:77.09},BOM:{lat:19.09,lon:72.87},
+  // ── Middle East / Africa ──
+  DXB:{lat:25.25,lon:55.36},DOH:{lat:25.26,lon:51.57},AUH:{lat:24.44,lon:54.65},
+  CAI:{lat:30.12,lon:31.41},NBO:{lat:-1.32,lon:36.93},JNB:{lat:-26.14,lon:28.25},
 };
 
 function getIATACode(icaoOrIata) {
@@ -76,7 +126,7 @@ export default function FlightMap() {
   const [worldData, setWorldData] = useState(null);
   const [flights, setFlights] = useState([]);
   const [connected, setConnected] = useState(false);
-  const [targetAirport, setTargetAirport] = useState("KJFK");
+  const [targetAirport, setTargetAirport] = useState("");
   const wsRef = useRef(null);
 
   // load world map once
@@ -104,8 +154,9 @@ export default function FlightMap() {
       .catch(err => console.error("Failed to load backend config:", err));
   }, []);
 
-  // websocket connection
+  // websocket connection — only open once we know the real airport code
   useEffect(() => {
+    if (!targetAirport) return;
     const ws = new WebSocket(`ws://127.0.0.1:8000/ws/${targetAirport}`);
     wsRef.current = ws;
 
