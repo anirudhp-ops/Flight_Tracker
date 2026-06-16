@@ -1,5 +1,5 @@
 import networkx as nx
-from flight_tracker.models.events import FlightEvent
+from flight_tracker.models.events import FlightEvent, EventType, FlightStatus
 from collections import deque
 
 
@@ -10,6 +10,7 @@ class GraphEngine:
     def add_flight(self, flight: FlightEvent) -> None:
         self.graph.add_node(
             flight.flight_key,
+            event=flight,
             flight_id=flight.flight_id,
             airline_code=flight.airline_code,
             flight_number=flight.flight_number,
@@ -19,7 +20,7 @@ class GraphEngine:
             scheduled_arrival=flight.scheduled_arrival,
             delay_minutes=flight.delay_minutes,
             status=flight.status.value,
-    )
+        )
     def add_edges_for_flight(self, new_flight: FlightEvent) -> None:
         for node_key, attrs in self.graph.nodes(data=True):
             if node_key == new_flight.flight_key:
@@ -47,7 +48,7 @@ class GraphEngine:
             for row in rows:
                 event = FlightEvent(
                     flight_id=row["flight_id"],
-                    event_type=EventType(row["event_type"]),
+                    event_type=EventType.DELAY if row["delay_minutes"] > 0 else EventType.DEPARTURE,
                     airline_code=row["airline_code"],
                     flight_number=row["flight_number"],
                     origin=row["origin"],
@@ -55,15 +56,11 @@ class GraphEngine:
                     aircraft_id=row["aircraft_id"],
                     gate_id=row["gate_id"],
                     scheduled_departure=row["scheduled_departure"],
-                    estimated_departure=row["estimated_departure"],
-                    actual_departure=row["actual_departure"],
                     scheduled_arrival=row["scheduled_arrival"],
-                    estimated_arrival=row["estimated_arrival"],
-                    actual_arrival=row["actual_arrival"],
                     delay_minutes=row["delay_minutes"],
                     status=FlightStatus(row["status"]),
                     passenger_count=row["passenger_count"],
-                    timestamp=row["timestamp"],
+                    timestamp=row["last_updated"],
                 )
                 self.add_flight(event)
                 self.add_edges_for_flight(event)
@@ -73,10 +70,11 @@ class GraphEngine:
         self.add_edges_for_flight(event)
     
 
-    def propagate_delay(self, flight_key: str, delay_minutes: int) -> None:
+    def propagate_delay(self, flight_key: str, delay_minutes: int) -> list[FlightEvent]:
         queue = deque()
         queue.append((flight_key, delay_minutes))
         visited = set()
+        updated_events = []
 
         while queue:
             current_key, current_delay = queue.popleft()
@@ -84,14 +82,27 @@ class GraphEngine:
                 continue
             visited.add(current_key)
 
+            if current_key not in self.graph:
+                continue
+
             for neighbor_key in self.graph.neighbors(current_key):
                 if neighbor_key in visited:
                     continue
                 neighbor_delay = self.graph.nodes[neighbor_key]["delay_minutes"]
                 propagated = int(current_delay * 0.75)
                 new_delay = max(neighbor_delay, propagated)
-                self.graph.nodes[neighbor_key]["delay_minutes"] = new_delay
+                
+                if new_delay != neighbor_delay:
+                    self.graph.nodes[neighbor_key]["delay_minutes"] = new_delay
+                    if "event" in self.graph.nodes[neighbor_key]:
+                        event_obj = self.graph.nodes[neighbor_key]["event"]
+                        event_obj.delay_minutes = new_delay
+                        if new_delay > 0:
+                            event_obj.event_type = EventType.DELAY
+                        updated_events.append(event_obj)
+                
                 queue.append((neighbor_key, new_delay))
+        return updated_events
                 
     def resolve_gate_conflicts(self) -> list[dict]:
         gate_pool = [f"{terminal}{num}" for terminal in ["A","B","C","T"] for num in range(1,15)]
@@ -121,12 +132,18 @@ class GraphEngine:
             new_gate = free_gates[0]
             used_gates.add(new_gate)
             self.graph.nodes[dst]["gate_id"] = new_gate
+            
+            if "event" in self.graph.nodes[dst]:
+                self.graph.nodes[dst]["event"].gate_id = new_gate
+
             self.graph.remove_edge(src, dst)
 
             reassignments.append({
                 "flight_key": dst,
                 "old_gate": dst_attrs["gate_id"],
                 "new_gate": new_gate,
+                "event": self.graph.nodes[dst].get("event"),
             })
 
-        return reassignments            
+        return reassignments
+            

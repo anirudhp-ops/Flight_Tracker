@@ -1,2 +1,3 @@
-.envml/model.pkl
-*.csv
+.env
+ml/model.pkl
+*.pkl

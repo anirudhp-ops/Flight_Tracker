@@ -8,7 +8,23 @@ const airports = {
   DEN:{lat:39.86,lon:-104.67},FLL:{lat:26.07,lon:-80.15},MCO:{lat:28.43,lon:-81.31},
   MIA:{lat:25.79,lon:-80.29},SEA:{lat:47.45,lon:-122.31},IAH:{lat:29.98,lon:-95.34},
   SJU:{lat:18.44,lon:-66.00},LHR:{lat:51.47,lon:-0.46},NRT:{lat:35.77,lon:140.39},
+  DFW:{lat:32.90,lon:-97.04},LAS:{lat:36.08,lon:-115.15},
+  SMF:{lat:38.70,lon:-121.59},ONT:{lat:34.06,lon:-117.60},SBA:{lat:34.43,lon:-119.84},
+  PHX:{lat:33.44,lon:-112.01},PDX:{lat:45.59,lon:-122.60},CDG:{lat:49.01,lon:2.55},
 };
+
+function getIATACode(icaoOrIata) {
+  if (!icaoOrIata) return "";
+  const code = icaoOrIata.toUpperCase();
+  if (code.length === 3) return code;
+  if (code.length === 4) {
+    if (code === "EGLL") return "LHR";
+    if (code === "RJAA") return "NRT";
+    if (code === "TJSJ") return "SJU";
+    if (code.startsWith("K")) return code.slice(1);
+  }
+  return code;
+}
 
 function planeColor(f, selected) {
   if (selected) return "#79c0ff";
@@ -46,6 +62,7 @@ export default function FlightMap() {
   const [worldData, setWorldData] = useState(null);
   const [flights, setFlights] = useState([]);
   const [connected, setConnected] = useState(false);
+  const [targetAirport, setTargetAirport] = useState("KJFK");
   const wsRef = useRef(null);
 
   // load world map once
@@ -55,9 +72,21 @@ export default function FlightMap() {
       .then(setWorldData);
   }, []);
 
+  // load backend configuration
+  useEffect(() => {
+    fetch("http://localhost:8000/api/config")
+      .then(r => r.json())
+      .then(data => {
+        if (data.target_airport) {
+          setTargetAirport(data.target_airport);
+        }
+      })
+      .catch(err => console.error("Failed to load backend config:", err));
+  }, []);
+
   // websocket connection
   useEffect(() => {
-    const ws = new WebSocket("ws://localhost:8000/ws/JFK");
+    const ws = new WebSocket(`ws://localhost:8000/ws/${targetAirport}`);
     wsRef.current = ws;
 
     ws.onopen = () => setConnected(true);
@@ -77,7 +106,7 @@ export default function FlightMap() {
     };
 
     return () => ws.close();
-  }, []);
+  }, [targetAirport]);
 
   // d3 render
   useEffect(() => {
@@ -91,7 +120,7 @@ export default function FlightMap() {
     const path = d3.geoPath(proj);
 
     function project(code) {
-      const a = airports[code];
+      const a = airports[getIATACode(code)];
       return a ? proj([a.lon, a.lat]) : null;
     }
 
@@ -131,7 +160,7 @@ export default function FlightMap() {
       apG.append("line").attr("x1",x-s).attr("y1",y).attr("x2",x+s).attr("y2",y)
         .attr("stroke","#388bfd").attr("stroke-width",1).attr("stroke-opacity",0.7);
       apG.append("text").attr("x",x+7).attr("y",y+3.5)
-        .attr("font-size",8).attr("fill","#8b949e").text(code);
+        .attr("font-size",8).attr("fill","#8b949e").text(getIATACode(code));
     });
 
     displayFlights.forEach(f => {
@@ -177,7 +206,7 @@ export default function FlightMap() {
     <div style={{background:"#0d1117",borderRadius:12,overflow:"hidden",border:"0.5px solid #30363d",fontFamily:"sans-serif",color:"#e6edf3"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",background:"#161b22",borderBottom:"0.5px solid #30363d"}}>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <span style={{fontSize:13,fontWeight:500}}>FlightTracker — JFK</span>
+          <span style={{fontSize:13,fontWeight:500}}>FlightTracker — {getIATACode(targetAirport)}</span>
           <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#3d1515",color:"#ff7b72"}}>{delayed} delayed</span>
           <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:connected?"#0d2818":"#2a2a2a",color:connected?"#56d364":"#8b949e"}}>
             {connected ? "● Live" : "○ Connecting..."}
