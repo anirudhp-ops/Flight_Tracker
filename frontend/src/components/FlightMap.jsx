@@ -94,7 +94,7 @@ export default function FlightMap() {
 
   // load backend configuration
   useEffect(() => {
-    fetch("http://localhost:8000/api/config")
+    fetch("http://127.0.0.1:8000/api/config")
       .then(r => r.json())
       .then(data => {
         if (data.target_airport) {
@@ -106,7 +106,7 @@ export default function FlightMap() {
 
   // websocket connection
   useEffect(() => {
-    const ws = new WebSocket(`ws://localhost:8000/ws/${targetAirport}`);
+    const ws = new WebSocket(`ws://127.0.0.1:8000/ws/${targetAirport}`);
     wsRef.current = ws;
 
     ws.onopen = () => setConnected(true);
@@ -161,12 +161,14 @@ export default function FlightMap() {
       const p1 = project(f.origin), p2 = project(f.destination);
       if (!p1 || !p2) return;
       const ctrl = ctrlPoint(p1, p2);
+      const isDelayed = f.delay_minutes > 0;
       routeG.append("path")
         .attr("d", `M${p1[0]},${p1[1]} Q${ctrl[0]},${ctrl[1]} ${p2[0]},${p2[1]}`)
         .attr("fill", "none")
-        .attr("stroke", f.delay_minutes > 0 ? "#ff7b72" : "#1e3050")
-        .attr("stroke-width", f.delay_minutes > 0 ? 1.5 : 0.7)
-        .attr("stroke-opacity", f.delay_minutes > 0 ? 0.65 : 0.25);
+        .attr("stroke", isDelayed ? "#ff7b72" : "#388bfd")
+        .attr("stroke-width", isDelayed ? 1.8 : 1.0)
+        .attr("stroke-opacity", isDelayed ? 0.70 : 0.45)
+        .attr("stroke-dasharray", isDelayed ? "none" : "4,3");
     });
 
     const apSet = new Set(displayFlights.flatMap(f => [f.origin, f.destination]).filter(Boolean));
@@ -205,14 +207,14 @@ export default function FlightMap() {
       }
 
       g.append("g").attr("transform", `rotate(${angle})`)
-        .append("path").attr("d", "M0,-7 L4,4 L0,2 L-4,4 Z")
+        .append("path").attr("d", "M0,-9 L5,5 L0,2.5 L-5,5 Z")
         .attr("fill", col).attr("stroke", "#0d1117").attr("stroke-width", 0.8);
 
       if (f.delay_minutes > 0) {
-        g.append("circle").attr("cx",7).attr("cy",-7).attr("r",4)
+        g.append("circle").attr("cx",8).attr("cy",-8).attr("r",5)
           .attr("fill","#ff7b72").attr("stroke","#0d1117").attr("stroke-width",0.5);
-        g.append("text").attr("x",7).attr("y",-4)
-          .attr("text-anchor","middle").attr("font-size",5).attr("font-weight",700)
+        g.append("text").attr("x",8).attr("y",-5)
+          .attr("text-anchor","middle").attr("font-size",6).attr("font-weight",700)
           .attr("fill","#0d1117").text("!");
       }
     });
@@ -221,12 +223,14 @@ export default function FlightMap() {
 
   const selectedFlight = flights.find(f => f.flight_key === selected);
   const delayed = flights.filter(f => f.delay_minutes > 0).length;
+  const total = flights.length;
 
   return (
     <div style={{background:"#0d1117",borderRadius:12,overflow:"hidden",border:"0.5px solid #30363d",fontFamily:"sans-serif",color:"#e6edf3"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",background:"#161b22",borderBottom:"0.5px solid #30363d"}}>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:13,fontWeight:500}}>FlightTracker — {getIATACode(targetAirport)}</span>
+          <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#0d1f3c",color:"#79c0ff"}}>{total} flights</span>
           <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#3d1515",color:"#ff7b72"}}>{delayed} delayed</span>
           <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:connected?"#0d2818":"#2a2a2a",color:connected?"#56d364":"#8b949e"}}>
             {connected ? "● Live" : "○ Connecting..."}
