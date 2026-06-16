@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FlightTracker — SFO</title>
+  <meta name="description" content="Real-time 3D flight tracker for San Francisco International Airport">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
+
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #020810;
+      overflow: hidden;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    canvas {
+      display: block;
+      cursor: grab;
+      outline: none;
+    }
+    canvas.dragging { cursor: grabbing !important; }
+
+    /* ─── HUD: top-left ─────────────────────────────────────────── */
+    #hud {
+      position: fixed;
+      top: 28px;
+      left: 28px;
+      z-index: 20;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    #hud-title {
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      color: #c9d1d9;
+      text-shadow: 0 0 28px rgba(55, 138, 221, 0.55);
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    #hud-title .plane-icon {
+      font-size: 18px;
+      color: #378add;
+      display: inline-block;
+    }
+
+    #hud-badges {
+      display: flex;
+      gap: 7px;
+    }
+
+    .badge {
+      font-size: 11px;
+      font-weight: 500;
+      padding: 3px 10px;
+      border-radius: 20px;
+      letter-spacing: 0.02em;
+    }
+
+    .badge-flights {
+      background: rgba(55, 138, 221, 0.10);
+      color: #79c0ff;
+      border: 1px solid rgba(55, 138, 221, 0.22);
+    }
+
+    .badge-delayed {
+      background: rgba(224, 82, 82, 0.10);
+      color: #ff7b72;
+      border: 1px solid rgba(224, 82, 82, 0.22);
+    }
+
+    /* ─── Legend: bottom-left ───────────────────────────────────── */
+    #legend {
+      position: fixed;
+      bottom: 30px;
+      left: 28px;
+      z-index: 20;
+      pointer-events: none;
+      user-select: none;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .leg-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      font-weight: 500;
+      color: #6e7681;
+    }
+
+    .leg-pip {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    /* ─── Tooltip ───────────────────────────────────────────────── */
+    #tooltip {
+      position: fixed;
+      display: none;
+      z-index: 100;
+      pointer-events: none;
+      background: rgba(8, 13, 22, 0.94);
+      border: 1px solid rgba(48, 54, 61, 0.75);
+      border-radius: 10px;
+      padding: 13px 16px;
+      min-width: 168px;
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      box-shadow: 0 8px 36px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255,255,255,0.04);
+    }
+
+    #tt-iata {
+      font-size: 22px;
+      font-weight: 700;
+      color: #e6edf3;
+      line-height: 1;
+      margin-bottom: 3px;
+    }
+
+    #tt-name {
+      font-size: 11px;
+      color: #6e7681;
+      margin-bottom: 9px;
+    }
+
+    #tt-status {
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .s-ok   { color: #4caf7a; }
+    .s-late { color: #e05252; }
+
+    /* ─── Loading hint ──────────────────────────────────────────── */
+    #loading {
+      position: fixed;
+      bottom: 30px;
+      right: 28px;
+      font-size: 10px;
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #2a3a4a;
+      z-index: 20;
+      pointer-events: none;
+      transition: opacity 0.8s ease;
+    }
+  </style>
+</head>
+<body>
+
+<canvas id="c" tabindex="0"></canvas>
+
+<!-- ── HUD ──────────────────────────────────────────────────────── -->
+<div id="hud">
+  <div id="hud-title">
+    <span class="plane-icon">✈</span>
+    FlightTracker — SFO
+  </div>
+  <div id="hud-badges">
+    <span class="badge badge-flights" id="badge-total">— flights</span>
+    <span class="badge badge-delayed" id="badge-delayed">— delayed</span>
+  </div>
+</div>
+
+<!-- ── Legend ───────────────────────────────────────────────────── -->
+<div id="legend">
+  <div class="leg-row">
+    <div class="leg-pip" style="background:#4caf7a;box-shadow:0 0 7px #4caf7a88;"></div>
+    On time
+  </div>
+  <div class="leg-row">
+    <div class="leg-pip" style="background:#e05252;box-shadow:0 0 7px #e0525288;"></div>
+    Delayed
+  </div>
+</div>
+
+<!-- ── Tooltip ──────────────────────────────────────────────────── -->
+<div id="tooltip">
+  <div id="tt-iata"></div>
+  <div id="tt-name"></div>
+  <div id="tt-status"></div>
+</div>
+
+<div id="loading">Loading borders…</div>
+
+<!-- ════════════════════════════════════════════════════════════════
+     MAIN SCRIPT
+════════════════════════════════════════════════════════════════ -->
+<script>
+'use strict';
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FLIGHT DATA — 43 SFO routes
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const SFO = { lat: 37.62, lon: -122.38 };
+
+const ROUTES = [
+  // ── North America · Domestic ─────────────────────────────────
+  { iata:'LAX', name:'Los Angeles',       lat: 33.94,  lon:-118.41, delay:  0 },
+  { iata:'LAS', name:'Las Vegas',         lat: 36.08,  lon:-115.15, delay:  0 },
+  { iata:'SEA', name:'Seattle',           lat: 47.45,  lon:-122.31, delay: 12 },
+  { iata:'PDX', name:'Portland',          lat: 45.59,  lon:-122.60, delay:  0 },
+  { iata:'DEN', name:'Denver',            lat: 39.86,  lon:-104.67, delay: 45 },
+  { iata:'PHX', name:'Phoenix',           lat: 33.44,  lon:-112.01, delay:  0 },
+  { iata:'SLC', name:'Salt Lake City',    lat: 40.79,  lon:-111.98, delay:  0 },
+  { iata:'SAN', name:'San Diego',         lat: 32.73,  lon:-117.19, delay:  0 },
+  { iata:'SMF', name:'Sacramento',        lat: 38.70,  lon:-121.59, delay:  0 },
+  { iata:'ORD', name:"Chicago O'Hare",    lat: 41.97,  lon: -87.91, delay: 67 },
+  { iata:'MDW', name:'Chicago Midway',    lat: 41.79,  lon: -87.74, delay:  0 },
+  { iata:'JFK', name:'New York JFK',      lat: 40.64,  lon: -73.78, delay:  0 },
+  { iata:'EWR', name:'Newark',            lat: 40.69,  lon: -74.17, delay: 22 },
+  { iata:'BOS', name:'Boston',            lat: 42.36,  lon: -71.01, delay: 23 },
+  { iata:'ATL', name:'Atlanta',           lat: 33.64,  lon: -84.43, delay:  0 },
+  { iata:'DFW', name:'Dallas / Ft Worth', lat: 32.90,  lon: -97.04, delay:  0 },
+  { iata:'MIA', name:'Miami',             lat: 25.79,  lon: -80.29, delay: 35 },
+  { iata:'IAH', name:'Houston',           lat: 29.98,  lon: -95.34, delay:  0 },
+  { iata:'MSP', name:'Minneapolis',       lat: 44.88,  lon: -93.22, delay:  0 },
+  { iata:'MCO', name:'Orlando',           lat: 28.43,  lon: -81.31, delay: 18 },
+  { iata:'HNL', name:'Honolulu',          lat: 21.33,  lon:-157.92, delay:  0 },
+  { iata:'OGG', name:'Maui',              lat: 20.90,  lon:-156.43, delay:  0 },
+  { iata:'ANC', name:'Anchorage',         lat: 61.17,  lon:-150.00, delay:  0 },
+  // ── Canada ───────────────────────────────────────────────────
+  { iata:'YVR', name:'Vancouver',         lat: 49.19,  lon:-123.18, delay:  8 },
+  { iata:'YYZ', name:'Toronto',           lat: 43.68,  lon: -79.63, delay:  0 },
+  { iata:'YUL', name:'Montréal',          lat: 45.46,  lon: -73.74, delay:  0 },
+  // ── Mexico / Caribbean ───────────────────────────────────────
+  { iata:'MEX', name:'Mexico City',       lat: 19.44,  lon: -99.07, delay:  0 },
+  { iata:'CUN', name:'Cancún',            lat: 21.04,  lon: -86.87, delay:  0 },
+  { iata:'GDL', name:'Guadalajara',       lat: 20.52,  lon:-103.31, delay:  0 },
+  // ── Europe ───────────────────────────────────────────────────
+  { iata:'LHR', name:'London Heathrow',   lat: 51.47,  lon:  -0.46, delay:  0 },
+  { iata:'CDG', name:'Paris CDG',         lat: 49.01,  lon:   2.55, delay: 30 },
+  { iata:'FRA', name:'Frankfurt',         lat: 50.04,  lon:   8.56, delay:  0 },
+  { iata:'AMS', name:'Amsterdam',         lat: 52.31,  lon:   4.77, delay:  0 },
+  { iata:'ZRH', name:'Zürich',            lat: 47.46,  lon:   8.55, delay: 52 },
+  { iata:'MAD', name:'Madrid',            lat: 40.47,  lon:  -3.56, delay:  0 },
+  { iata:'FCO', name:'Rome',              lat: 41.80,  lon:  12.24, delay:  0 },
+  // ── Asia ─────────────────────────────────────────────────────
+  { iata:'NRT', name:'Tokyo Narita',      lat: 35.77,  lon: 140.39, delay:  0 },
+  { iata:'ICN', name:'Seoul Incheon',     lat: 37.46,  lon: 126.44, delay:  0 },
+  { iata:'PEK', name:'Beijing',           lat: 40.08,  lon: 116.58, delay: 88 },
+  { iata:'PVG', name:'Shanghai',          lat: 31.14,  lon: 121.80, delay:  0 },
+  { iata:'HKG', name:'Hong Kong',         lat: 22.31,  lon: 113.91, delay:  0 },
+  { iata:'SIN', name:'Singapore',         lat:  1.36,  lon: 103.99, delay: 15 },
+  { iata:'DEL', name:'New Delhi',         lat: 28.57,  lon:  77.09, delay:  0 },
+  { iata:'BOM', name:'Mumbai',            lat: 19.09,  lon:  72.87, delay:  0 },
+  // ── Pacific ──────────────────────────────────────────────────
+  { iata:'SYD', name:'Sydney',            lat:-33.95,  lon: 151.18, delay:  0 },
+  { iata:'AKL', name:'Auckland',          lat:-37.01,  lon: 174.79, delay:  0 },
+  // ── South America ────────────────────────────────────────────
+  { iata:'GRU', name:'São Paulo',         lat:-23.43,  lon: -46.47, delay:  0 },
+  { iata:'BOG', name:'Bogotá',            lat:  4.70,  lon: -74.15, delay:  0 },
+  { iata:'LIM', name:'Lima',              lat:-12.02,  lon: -77.11, delay:  0 },
+  // ── Africa ───────────────────────────────────────────────────
+  { iata:'JNB', name:'Johannesburg',      lat:-26.14,  lon:  28.25, delay: 40 },
+  { iata:'NBO', name:'Nairobi',           lat: -1.32,  lon:  36.93, delay:  0 },
+];
+
+// ── Populate HUD ────────────────────────────────────────────────
+const delayedCount = ROUTES.filter(r => r.delay > 0).length;
+document.getElementById('badge-total').textContent   = `${ROUTES.length} flights`;
+document.getElementById('badge-delayed').textContent = `${delayedCount} delayed`;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RENDERER / SCENE / CAMERA
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const canvas = document.getElementById('c');
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x020810, 1);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.z = 2.6;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LIGHTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Ambient — soft fill so the night side isn't pure black
+scene.add(new THREE.AmbientLight(0x1a2840, 0.75));
+
+// Sun — upper-right, cool blue-white
+const sun = new THREE.DirectionalLight(0x7ab4f5, 1.15);
+sun.position.set(5, 3, 5);
+scene.add(sun);
+
+// Rim — lower-left, very dim, gives depth to the silhouette
+const rim = new THREE.DirectionalLight(0x0a1830, 0.45);
+rim.position.set(-4, -2, -4);
+scene.add(rim);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// GLOBE GROUP — everything on the surface rotates together
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const globeGroup = new THREE.Group();
+scene.add(globeGroup);
+
+// ── Earth sphere ────────────────────────────────────────────────
+const earth = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 72, 72),
+  new THREE.MeshPhongMaterial({
+    color:     0x0d1a2e,
+    specular:  0x1a3a5c,
+    shininess: 18,
+  })
+);
+globeGroup.add(earth);
+
+// ── Atmospheric rim glow — slightly larger, back-face only ──────
+// Not in globeGroup so the camera-relative glow stays consistent
+const atmosphere = new THREE.Mesh(
+  new THREE.SphereGeometry(1.10, 64, 64),
+  new THREE.MeshPhongMaterial({
+    color:       0x1a50aa,
+    side:        THREE.BackSide,
+    transparent: true,
+    opacity:     0.28,
+  })
+);
+scene.add(atmosphere);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// UTILITY
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function latLonToVec3(lat, lon, r) {
+  r = r === undefined ? 1 : r;
+  var phi   = (90 - lat) * Math.PI / 180;
+  var theta = (lon + 180) * Math.PI / 180;
+  return new THREE.Vector3(
+    -r * Math.sin(phi) * Math.cos(theta),
+     r * Math.cos(phi),
+     r * Math.sin(phi) * Math.sin(theta)
+  );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// GRID LINES  (lat/lon every 20°)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var gridMat = new THREE.LineBasicMaterial({ color: 0x0f2030, transparent: true, opacity: 0.30 });
+
+// Latitude rings
+for (var lat = -80; lat <= 80; lat += 20) {
+  var latPts = [];
+  for (var lon = -180; lon <= 181; lon += 3) latPts.push(latLonToVec3(lat, lon, 1.002));
+  globeGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(latPts), gridMat));
+}
+
+// Longitude meridians
+for (var lon = -180; lon < 180; lon += 20) {
+  var lonPts = [];
+  for (var mlat = -90; mlat <= 90; mlat += 3) lonPts.push(latLonToVec3(mlat, lon, 1.002));
+  globeGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(lonPts), gridMat));
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// COUNTRY BORDERS (async TopoJSON fetch)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json')
+  .then(function(r) { return r.json(); })
+  .then(function(world) {
+    var mesh = topojson.mesh(world, world.objects.countries);
+    var seg  = [];
+
+    mesh.coordinates.forEach(function(line) {
+      for (var i = 0; i < line.length - 1; i++) {
+        var lo1 = line[i][0],   la1 = line[i][1];
+        var lo2 = line[i+1][0], la2 = line[i+1][1];
+        // Skip segments that jump across the antimeridian
+        if (Math.abs(lo2 - lo1) > 120) continue;
+        seg.push(latLonToVec3(la1, lo1, 1.001));
+        seg.push(latLonToVec3(la2, lo2, 1.001));
+      }
+    });
+
+    var borderMat = new THREE.LineBasicMaterial({
+      color: 0x1a3a4a, transparent: true, opacity: 0.60
+    });
+    globeGroup.add(
+      new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(seg), borderMat)
+    );
+
+    var el = document.getElementById('loading');
+    el.style.opacity = '0';
+    setTimeout(function() { el.remove(); }, 900);
+  })
+  .catch(function() {
+    document.getElementById('loading').textContent = '';
+  });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SFO ORIGIN MARKER
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var sfoPt = latLonToVec3(SFO.lat, SFO.lon, 1.012);
+
+var sfoDot = new THREE.Mesh(
+  new THREE.SphereGeometry(0.022, 16, 16),
+  new THREE.MeshBasicMaterial({ color: 0x378add })
+);
+sfoDot.position.copy(sfoPt);
+globeGroup.add(sfoDot);
+
+// Pulsing halo around SFO
+var sfoHalo = new THREE.Mesh(
+  new THREE.SphereGeometry(0.036, 16, 16),
+  new THREE.MeshBasicMaterial({ color: 0x378add, transparent: true, opacity: 0.20 })
+);
+sfoHalo.position.copy(sfoPt);
+globeGroup.add(sfoHalo);
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ARCS · AIRCRAFT · DESTINATION DOTS
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var arcAnims   = [];   // { curve, mat, aircraft, t, speed }
+var destMeshes = [];   // for raycasting hover
+
+var sfoVec = latLonToVec3(SFO.lat, SFO.lon, 1.0);
+
+ROUTES.forEach(function(route, i) {
+  var isDelayed = route.delay > 0;
+  var col       = isDelayed ? 0xe05252 : 0x4caf7a;
+
+  var dstVec = latLonToVec3(route.lat, route.lon, 1.0);
+
+  // Great-circle angle between SFO and destination → drives arc height
+  var angle = sfoVec.angleTo(dstVec);                 // 0 … π
+  var lift  = 0.15 + (angle / Math.PI) * 0.25;        // 0.15 (short) … 0.40 (transpacific)
+
+  // Quadratic bezier control point: midpoint direction lifted off the surface
+  // Multiplying by (1 + lift * 2) so the curve peak reaches roughly 1 + lift
+  var ctrl = sfoVec.clone().add(dstVec).normalize().multiplyScalar(1.0 + lift * 2.0);
+
+  var curve  = new THREE.QuadraticBezierCurve3(sfoVec.clone(), ctrl, dstVec.clone());
+  var arcPts = curve.getPoints(80);
+
+  var arcMat = new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.75 });
+  globeGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(arcPts), arcMat));
+
+  // Aircraft — small sphere travelling along the arc
+  var aircraft = new THREE.Mesh(
+    new THREE.SphereGeometry(0.009, 8, 8),
+    new THREE.MeshBasicMaterial({ color: col })
+  );
+  // Stagger starting positions so aircraft aren't all bunched at SFO on load
+  var t0 = i / ROUTES.length;
+  aircraft.position.copy(curve.getPoint(t0));
+  globeGroup.add(aircraft);
+
+  arcAnims.push({
+    curve  : curve,
+    mat    : arcMat,
+    aircraft: aircraft,
+    t      : t0,
+    speed  : 0.00065 + Math.random() * 0.00055,   // slight speed variation per route
+  });
+
+  // Destination airport dot
+  var destPos = latLonToVec3(route.lat, route.lon, 1.012);
+  var dot = new THREE.Mesh(
+    new THREE.SphereGeometry(0.012, 12, 12),
+    new THREE.MeshBasicMaterial({ color: col })
+  );
+  dot.position.copy(destPos);
+  dot.userData = route;
+  globeGroup.add(dot);
+  destMeshes.push(dot);
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DRAG-TO-ROTATE WITH MOMENTUM
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var MAX_TILT  = 70 * Math.PI / 180;   // ±70° vertical clamp
+var isDrag    = false;
+var autoSpin  = true;
+var lastRelease = 0;
+var vel       = { x: 0, y: 0 };
+var prevPt    = { x: 0, y: 0 };
+var mouse2d   = new THREE.Vector2();
+
+function clampTilt() {
+  globeGroup.rotation.x = Math.max(-MAX_TILT, Math.min(MAX_TILT, globeGroup.rotation.x));
+}
+
+function ptrDown(cx, cy) {
+  isDrag   = true;
+  autoSpin = false;
+  vel      = { x: 0, y: 0 };
+  prevPt   = { x: cx, y: cy };
+  canvas.classList.add('dragging');
+}
+
+function ptrMove(cx, cy) {
+  // Hover raycasting (always)
+  var rect = canvas.getBoundingClientRect();
+  mouse2d.x =  ((cx - rect.left) / rect.width)  * 2 - 1;
+  mouse2d.y = -((cy - rect.top)  / rect.height) * 2 + 1;
+  doHover(cx, cy);
+
+  if (!isDrag) return;
+  var dx = cx - prevPt.x;
+  var dy = cy - prevPt.y;
+  vel.y = dx * 0.005;
+  vel.x = dy * 0.005;
+  globeGroup.rotation.y += dx * 0.005;
+  globeGroup.rotation.x += dy * 0.005;
+  clampTilt();
+  prevPt = { x: cx, y: cy };
+}
+
+function ptrUp() {
+  isDrag      = false;
+  lastRelease = Date.now();
+  canvas.classList.remove('dragging');
+}
+
+// Mouse
+canvas.addEventListener('mousedown',  function(e) { ptrDown(e.clientX, e.clientY); });
+window.addEventListener('mousemove',  function(e) { ptrMove(e.clientX, e.clientY); });
+window.addEventListener('mouseup',    function()  { ptrUp(); });
+canvas.addEventListener('mouseleave', function()  { hideTooltip(); });
+
+// Touch
+canvas.addEventListener('touchstart', function(e) {
+  e.preventDefault();
+  ptrDown(e.touches[0].clientX, e.touches[0].clientY);
+}, { passive: false });
+canvas.addEventListener('touchmove', function(e) {
+  e.preventDefault();
+  ptrMove(e.touches[0].clientX, e.touches[0].clientY);
+}, { passive: false });
+canvas.addEventListener('touchend', function(e) {
+  e.preventDefault();
+  ptrUp();
+}, { passive: false });
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RAYCASTING HOVER & TOOLTIP
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var raycaster = new THREE.Raycaster();
+var tooltip   = document.getElementById('tooltip');
+var ttIata    = document.getElementById('tt-iata');
+var ttName    = document.getElementById('tt-name');
+var ttStatus  = document.getElementById('tt-status');
+
+function showTooltip(route, px, py) {
+  ttIata.textContent = route.iata;
+  ttName.textContent = route.name;
+  if (route.delay > 0) {
+    ttStatus.innerHTML = '<span class="s-late">⚠ Delayed +' + route.delay + ' min</span>';
+  } else {
+    ttStatus.innerHTML = '<span class="s-ok">✓ On time</span>';
+  }
+  tooltip.style.display = 'block';
+  // Keep tooltip on-screen
+  var tw = tooltip.offsetWidth  || 168;
+  var th = tooltip.offsetHeight || 80;
+  var tx = Math.min(px + 16, window.innerWidth  - tw - 10);
+  var ty = Math.max(Math.min(py - 10, window.innerHeight - th - 10), 10);
+  tooltip.style.left = tx + 'px';
+  tooltip.style.top  = ty + 'px';
+}
+
+function hideTooltip() {
+  tooltip.style.display = 'none';
+}
+
+function doHover(px, py) {
+  raycaster.setFromCamera(mouse2d, camera);
+  var hits = raycaster.intersectObjects(destMeshes, false);
+  if (hits.length > 0) {
+    canvas.style.cursor = 'pointer';
+    showTooltip(hits[0].object.userData, px, py);
+  } else if (!isDrag) {
+    canvas.style.cursor = '';
+    hideTooltip();
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ANIMATION LOOP
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+var tick = 0;
+
+function animate() {
+  requestAnimationFrame(animate);
+  tick++;
+
+  // ── Rotation / momentum ────────────────────────────────────
+  if (!isDrag) {
+    if (Date.now() - lastRelease > 1500) autoSpin = true;
+
+    if (autoSpin) {
+      globeGroup.rotation.y += 0.0012;
+    } else {
+      // Momentum decays at ~91% per frame
+      vel.x *= 0.91;
+      vel.y *= 0.91;
+      globeGroup.rotation.y += vel.y;
+      globeGroup.rotation.x += vel.x;
+      clampTilt();
+    }
+  }
+
+  // ── Arc pulse (staggered sine, shared clock) ───────────────
+  var basePhase = tick * 0.038;
+  arcAnims.forEach(function(obj, i) {
+    var phase = basePhase + i * 0.27;
+    obj.mat.opacity = 0.28 + 0.52 * (0.5 + 0.5 * Math.sin(phase));
+
+    // Advance aircraft along arc, wrapping at 1
+    obj.t = (obj.t + obj.speed) % 1.0;
+    obj.aircraft.position.copy(obj.curve.getPoint(obj.t));
+  });
+
+  // ── SFO halo pulse ─────────────────────────────────────────
+  var haloScale = 1 + 0.20 * Math.sin(tick * 0.065);
+  sfoHalo.scale.setScalar(haloScale);
+
+  renderer.render(scene, camera);
+}
+
+animate();
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// RESIZE
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+window.addEventListener('resize', function() {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+});
+</script>
+</body>
+</html>
