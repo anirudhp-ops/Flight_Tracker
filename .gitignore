@@ -1,3 +1,5 @@
 .env
 ml/model.pkl
 *.pkl
+T_ONTIME_MARKETING.csv
+*.csv
