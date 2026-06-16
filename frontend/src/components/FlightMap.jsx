@@ -47,12 +47,26 @@ function ctrlPoint(p1, p2) {
   return [(p1[0]+p2[0])/2, (p1[1]+p2[1])/2 - 35];
 }
 
+function parseDate(dateStr) {
+  if (!dateStr) return null;
+  if (dateStr instanceof Date) return dateStr;
+  let clean = dateStr.trim();
+  if (clean.includes(" ") && !clean.includes("T")) {
+    clean = clean.replace(" ", "T");
+  }
+  const tzRegex = /([+-]\d{2})$/;
+  if (tzRegex.test(clean)) {
+    clean = clean + ":00";
+  }
+  const d = new Date(clean);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 function flightPosition(f) {
-  if (!f.scheduled_departure || !f.scheduled_arrival) return 0.45;
-  const dep = new Date(f.scheduled_departure).getTime();
-  const arr = new Date(f.scheduled_arrival).getTime();
-  const now = Date.now();
-  const t = (now - dep) / (arr - dep);
+  const dep = parseDate(f.scheduled_departure);
+  const arr = parseDate(f.scheduled_arrival);
+  if (!dep || !arr) return 0.45;
+  const t = (Date.now() - dep.getTime()) / (arr.getTime() - dep.getTime());
   return Math.max(0.05, Math.min(0.95, t));
 }
 
@@ -67,9 +81,15 @@ export default function FlightMap() {
 
   // load world map once
   useEffect(() => {
-    fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json")
+    fetch("/countries-110m.json")
       .then(r => r.json())
-      .then(setWorldData);
+      .then(setWorldData)
+      .catch(err => {
+        console.error("Failed to load local map, falling back to CDN:", err);
+        fetch("https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json")
+          .then(r => r.json())
+          .then(setWorldData);
+      });
   }, []);
 
   // load backend configuration

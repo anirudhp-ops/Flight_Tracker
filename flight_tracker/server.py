@@ -8,7 +8,7 @@ from flight_tracker.models.events import FlightEvent
 from flight_tracker.graph.engine import GraphEngine
 from flight_tracker.ingestion.worker import run as worker_run
 from flight_tracker.ingestion.publisher import RedisPublisher
-from flight_tracker.ingestion.client import MockFlightAwareClient
+from flight_tracker.ingestion.client import MockFlightAwareClient, FlightAwareClient
 from ml.predictor import DelayPredictor
 
 load_dotenv()
@@ -47,7 +47,15 @@ async def startup():
     )
     await graph_engine.load_from_db(pool)
     airport = os.getenv("TARGET_AIRPORT", "KJFK")
-    client = MockFlightAwareClient(airport)
+    api_key = os.getenv("FLIGHTAWARE_API_KEY")
+    
+    if api_key and api_key.strip() != "" and api_key != "YOUR_API_KEY":
+        client = FlightAwareClient(api_key)
+        print("Ingestion client: real FlightAware API Client started.")
+    else:
+        client = MockFlightAwareClient(airport)
+        print("Ingestion client: Mock FlightAware Client started.")
+
     publisher = RedisPublisher(redis_client)
     asyncio.create_task(worker_run(client, publisher, airport))
 
