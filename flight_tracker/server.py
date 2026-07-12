@@ -48,13 +48,16 @@ async def startup():
     await graph_engine.load_from_db(pool)
     airport = os.getenv("TARGET_AIRPORT", "KJFK")
     api_key = os.getenv("FLIGHTAWARE_API_KEY")
+    live_api_enabled = os.getenv("ENABLE_FLIGHTAWARE_API", "false").lower() in {
+        "1", "true", "yes", "on"
+    }
     
-    if api_key and api_key.strip() != "" and api_key != "YOUR_API_KEY":
+    if live_api_enabled and api_key and api_key.strip() != "" and api_key != "YOUR_API_KEY":
         client = FlightAwareClient(api_key)
         print("Ingestion client: real FlightAware API Client started.")
     else:
         client = MockFlightAwareClient(airport)
-        print("Ingestion client: Mock FlightAware Client started.")
+        print("Ingestion client: Mock FlightAware Client started (paid API disabled).")
 
     publisher = RedisPublisher(redis_client)
     asyncio.create_task(worker_run(client, publisher, airport))
