@@ -2,11 +2,8 @@
 
 Flight Tracker is an experimental real-time flight visualization and delay-propagation system. It combines a React/D3 world map with a FastAPI backend, Redis pub/sub, PostgreSQL event storage, a NetworkX dependency graph, and a small scikit-learn delay model.
 
-The repository currently runs on generated mock flight data by default. Paid FlightAware AeroAPI access is explicitly disabled unless two environment variables are set.
-
 ## Current capabilities
 
-- Displays 100 generated flights on an interactive world map.
 - Shows routes, aircraft positions, delays, gates, and flight details.
 - Defines a FlightAware AeroAPI ingestion client and a no-cost mock client.
 - Publishes backend flight events through Redis and streams them over WebSockets.
