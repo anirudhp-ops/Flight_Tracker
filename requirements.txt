@@ -1,0 +1,24 @@
+# Backend dependencies for Flight Tracker.
+# Install with: pip install -r requirements.txt
+#
+# uvicorn[standard] pulls in `websockets`, which uvicorn needs to serve
+# /ws/{airport_code}. Plain `uvicorn` alone silently 404s every WebSocket
+# request ("No supported WebSocket library detected").
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+redis==8.1.0
+asyncpg==0.31.0
+python-dotenv==1.2.2
+httpx==0.28.1
+pydantic==2.13.4
+pydantic-settings==2.15.0
+networkx==3.6.1
+numpy==2.5.1
+
+# Pinned to match the scikit-learn version ml/model.pkl was trained and
+# pickled with (see ml/train.py). Installing a newer scikit-learn still
+# loads the pickle but prints InconsistentVersionWarning on every import.
+scikit-learn==1.7.2
+
+# ml/train.py only (not needed to run the server).
+pandas==3.0.5

@@ -1,17 +1,17 @@
-import os
 import asyncio
+from pathlib import Path
+
 import redis.asyncio as aioredis
-from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from flight_tracker.config import settings
+from flight_tracker.db.writer import create_pool
 from flight_tracker.models.events import FlightEvent
 from flight_tracker.graph.engine import GraphEngine
 from flight_tracker.ingestion.worker import run as worker_run
 from flight_tracker.ingestion.publisher import RedisPublisher
 from flight_tracker.ingestion.client import MockFlightAwareClient, FlightAwareClient
 from ml.predictor import DelayPredictor
-
-load_dotenv()
 
 app = FastAPI()
 
@@ -26,41 +26,60 @@ app.add_middleware(
 
 @app.get("/api/config")
 async def get_config():
-    return {"target_airport": os.getenv("TARGET_AIRPORT", "KJFK")}
+    return {"target_airport": settings.target_airport}
 
 graph_engine = GraphEngine()
-redis_host = os.getenv("REDIS_HOST", "localhost")
-redis_port = int(os.getenv("REDIS_PORT", "6379"))
-redis_client = aioredis.from_url(f"redis://{redis_host}:{redis_port}")
-predictor = DelayPredictor(os.path.join(os.path.dirname(__file__), "../ml/model.pkl"))
+redis_client = aioredis.from_url(f"redis://{settings.redis_host}:{settings.redis_port}")
+predictor = DelayPredictor(str(Path(__file__).resolve().parent.parent / "ml" / "model.pkl"))
+
+db_pool = None
+worker_task = None
+
+
+def _on_worker_done(task: asyncio.Task) -> None:
+    """Without this, an unhandled exception in the worker loop dies silently."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        print(f"FATAL: ingestion worker task crashed and is not running anymore: {exc!r}")
 
 
 @app.on_event("startup")
 async def startup():
-    import asyncpg
-    pool = await asyncpg.create_pool(
-        database=os.getenv("DB_NAME", "flight_tracker"),
-        user=os.getenv("DB_USER", "anirudhparasramouria"),
-        password=os.getenv("DB_PASSWORD"),
-        host=os.getenv("DB_HOST", "localhost"),
-        port=int(os.getenv("DB_PORT", "5432")),
-    )
-    await graph_engine.load_from_db(pool)
-    airport = os.getenv("TARGET_AIRPORT", "KJFK")
-    api_key = os.getenv("FLIGHTAWARE_API_KEY")
-    live_api_enabled = os.getenv("ENABLE_FLIGHTAWARE_API", "false").lower() in {
-        "1", "true", "yes", "on"
-    }
-    
-    if live_api_enabled and api_key and api_key.strip() != "" and api_key != "YOUR_API_KEY":
-        client = FlightAwareClient(api_key)
+    global db_pool, worker_task
+    db_pool = await create_pool()
+    await graph_engine.load_from_db(db_pool)
+
+    if settings.live_api_enabled:
+        client = FlightAwareClient(settings.flightaware_api_key)
         print("Ingestion client: real FlightAware API Client started.")
     else:
-        client = MockFlightAwareClient(airport)
+        client = MockFlightAwareClient(settings.target_airport)
         print("Ingestion client: Mock FlightAware Client started (paid API disabled).")
 
     publisher = RedisPublisher(redis_client)
-    asyncio.create_task(worker_run(client, publisher, airport))
+    # Keep a reference: an unreferenced asyncio.Task is only weakly held by
+    # the event loop and can be garbage-collected mid-run.
+    worker_task = asyncio.create_task(
+        worker_run(client, publisher, settings.target_airport, graph_engine)
+    )
+    worker_task.add_done_callback(_on_worker_done)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if worker_task is not None:
+        worker_task.remove_done_callback(_on_worker_done)
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+    if db_pool is not None:
+        await db_pool.close()
+    await redis_client.aclose()
+    print("Shutdown complete: worker stopped, DB pool closed, Redis client closed.")
 
 
 @app.websocket("/ws/{airport_code}")
@@ -84,18 +103,24 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
                 graph_engine.process_event(event)
 
                 if event.delay_minutes > 0:
+                    air_time = event.estimated_air_time_minutes
+                    distance = event.estimated_distance_miles
                     predicted = predictor.predict(
                         airline_code=event.airline_code,
                         origin=event.origin,
                         destination=event.destination,
                         dep_delay=event.delay_minutes,
-                        air_time=0,
-                        distance=0,
+                        air_time=air_time,
+                        distance=distance,
                     )
                     propagated_events = graph_engine.propagate_delay(event.flight_key, event.delay_minutes)
                     for pe in propagated_events:
                         await websocket.send_text(pe.model_dump_json())
-                    print(f"{event.flight_key} — predicted arrival delay: {predicted:.1f} min")
+                    print(
+                        f"{event.flight_key} — predicted arrival delay: {predicted:.1f} min "
+                        f"(inputs: dep_delay={event.delay_minutes}min, "
+                        f"air_time={air_time:.0f}min, distance={distance:.0f}mi)"
+                    )
 
                 # resolve any gate conflicts after propagation
                 reassignments = graph_engine.resolve_gate_conflicts()

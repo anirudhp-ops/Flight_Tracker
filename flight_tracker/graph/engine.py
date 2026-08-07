@@ -1,6 +1,8 @@
+from collections import deque
+from datetime import datetime, timedelta, timezone
+
 import networkx as nx
 from flight_tracker.models.events import FlightEvent, EventType, FlightStatus
-from collections import deque
 
 
 class GraphEngine:
@@ -104,6 +106,34 @@ class GraphEngine:
                 queue.append((neighbor_key, new_delay))
         return updated_events
                 
+    def prune_expired_flights(self, max_age_hours: float = 24) -> list[str]:
+        """
+        Removes landed flights whose arrival was more than max_age_hours ago.
+        The graph otherwise grows without bound for the life of the process,
+        and add_edges_for_flight is O(n) per new event against every node
+        ever added, so unpruned age directly costs both memory and CPU.
+        Returns the flight_keys that were removed.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        expired = []
+
+        for node_key, attrs in self.graph.nodes(data=True):
+            if attrs.get("status") != FlightStatus.LANDED.value:
+                continue
+            event_obj = attrs.get("event")
+            landed_at = (
+                (event_obj.actual_arrival or event_obj.scheduled_arrival)
+                if event_obj is not None
+                else attrs.get("scheduled_arrival")
+            )
+            if landed_at is not None and landed_at < cutoff:
+                expired.append(node_key)
+
+        for node_key in expired:
+            self.graph.remove_node(node_key)
+
+        return expired
+
     def resolve_gate_conflicts(self) -> list[dict]:
         gate_pool = [f"{terminal}{num}" for terminal in ["A","B","C","T"] for num in range(1,15)]
         used_gates = {attrs["gate_id"] for _, attrs in self.graph.nodes(data=True) if attrs["gate_id"]}

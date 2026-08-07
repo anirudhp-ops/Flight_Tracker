@@ -49,13 +49,18 @@ PostgreSQL support exists for historical events and active-flight state, but per
 - PostgreSQL
 - Redis
 
-The Python package metadata is currently incomplete, so install the imported backend dependencies directly:
+Install the pinned backend dependencies from `requirements.txt`:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install fastapi uvicorn redis asyncpg python-dotenv httpx pydantic networkx numpy scikit-learn
+pip install -r requirements.txt
 ```
+
+`requirements.txt` installs `uvicorn[standard]`, which pulls in `websockets`.
+Plain `uvicorn` (with no extras) does not include WebSocket support and will
+silently 404 every request to `/ws/{airport_code}` — install from
+`requirements.txt` rather than `pip install fastapi uvicorn ...` by hand.
 
 Install the frontend dependencies:
 

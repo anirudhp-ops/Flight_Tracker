@@ -1,4 +1,5 @@
 import asyncpg
+from flight_tracker.config import settings
 from flight_tracker.models.events import FlightEvent
 
 CREATE_TABLES_SQL = """
@@ -46,10 +47,14 @@ CREATE TABLE IF NOT EXISTS active_flights (
 );
 """
 
-async def create_pool(host, port, database, user, password):
+async def create_pool(host=None, port=None, database=None, user=None, password=None):
+    """Any argument left as None falls back to the shared config.settings."""
     return await asyncpg.create_pool(
-        host=host, port=port, database=database,
-        user=user, password=password,
+        host=host or settings.db_host,
+        port=port or settings.db_port,
+        database=database or settings.db_name,
+        user=user or settings.db_user,
+        password=password if password is not None else settings.db_password,
         min_size=2, max_size=10,
     )
 

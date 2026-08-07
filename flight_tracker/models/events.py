@@ -41,6 +41,14 @@ class FlightEvent(BaseModel):
     passenger_count: Optional[int] = None
     timestamp: datetime
 
+    # Real values when the ingestion source provides them (e.g. an AeroAPI
+    # field the client parsed). Left None when the source doesn't have them —
+    # use estimated_air_time_minutes / estimated_distance_miles below rather
+    # than defaulting to 0, since a duration/distance of exactly zero is
+    # never a real flight and skews DelayPredictor's output.
+    air_time: Optional[float] = None  # minutes
+    distance: Optional[float] = None  # statute miles
+
     @field_validator("delay_minutes")
     @classmethod
     def delay_not_negative(cls, v: int) -> int:
@@ -54,6 +62,27 @@ class FlightEvent(BaseModel):
     def flight_key(self) -> str:
         date_str = self.scheduled_departure.strftime("%Y%m%d")
         return f"{self.airline_code}{self.flight_number}-{date_str}"
+
+    @property
+    def estimated_air_time_minutes(self) -> float:
+        """Falls back to the scheduled block time (always available) when
+        `air_time` wasn't supplied by the ingestion source."""
+        if self.air_time is not None:
+            return self.air_time
+        delta = (self.scheduled_arrival - self.scheduled_departure).total_seconds() / 60
+        return max(0.0, delta)
+
+    @property
+    def estimated_distance_miles(self) -> float:
+        """Falls back to a rough distance-from-duration estimate (~450 mph
+        average commercial cruise speed) when `distance` wasn't supplied.
+        This is a coarse placeholder, not real geodata — good enough to
+        avoid feeding the model a distance of exactly 0, not good enough to
+        replace an actual route-distance lookup."""
+        if self.distance is not None:
+            return self.distance
+        AVG_CRUISE_MPH = 450.0
+        return round(self.estimated_air_time_minutes / 60 * AVG_CRUISE_MPH, 1)
 
 
 class AirportSnapshot(BaseModel):

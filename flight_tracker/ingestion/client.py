@@ -72,6 +72,14 @@ def _raw_flight_to_event(raw: dict[str, Any], captured_at: datetime) -> FlightEv
         ident = raw.get("ident", "")
         airline_code = raw.get("operator_iata", "XX")
         flight_number = raw.get("flight_number", "")
+
+        # AeroAPI's response shape varies by plan/endpoint; route_distance
+        # (statute miles) is present on some but not guaranteed. There is no
+        # direct "air time" field, so that's left unset here. Either way,
+        # FlightEvent.estimated_air_time_minutes / estimated_distance_miles
+        # provide a documented fallback instead of a literal 0.
+        route_distance = raw.get("route_distance")
+
         return FlightEvent(
             flight_id=fa_id or ident,
             event_type=event_type,
@@ -91,6 +99,7 @@ def _raw_flight_to_event(raw: dict[str, Any], captured_at: datetime) -> FlightEv
             status=status,
             passenger_count=None,  # AeroAPI doesn't provide this directly
             timestamp=captured_at,
+            distance=float(route_distance) if route_distance is not None else None,
         )
     except Exception:
         # Individual bad records get skipped, not crash the whole poll
