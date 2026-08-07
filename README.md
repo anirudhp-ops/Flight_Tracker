@@ -6,14 +6,14 @@ The repository currently runs on generated mock flight data by default. Paid Fli
 
 ## Current capabilities
 
-- Displays 100 generated flights on an interactive world map.
+- Displays live flights streamed from the backend over WebSocket on an interactive world map, with automatic reconnect if the connection drops.
 - Shows routes, aircraft positions, delays, gates, and flight details.
 - Defines a FlightAware AeroAPI ingestion client and a no-cost mock client.
-- Publishes backend flight events through Redis and streams them over WebSockets.
-- Defines PostgreSQL event-history and active-flight tables plus write helpers.
+- Publishes backend flight events through Redis, streams them over WebSockets, and persists every polled snapshot to PostgreSQL.
 - Builds aircraft-turn and gate-reuse relationships with NetworkX.
-- Propagates delays through the graph and attempts gate-conflict reassignment.
-- Loads a trained regression model and predicts arrival delay.
+- Propagates delays through the graph and reassigns conflicting gates.
+- Loads a trained regression model and predicts arrival delay, using the flight's own schedule to estimate air time/distance when the source doesn't supply them.
+- Prunes landed flights out of the in-memory graph after 24 hours so it doesn't grow unbounded for the life of the process.
 
 ## Cost protection and API key
 
@@ -34,13 +34,17 @@ This code-level switch prevents this project from making paid calls; it does not
 FlightAware or mock client
           |
           v
- ingestion worker -> Redis pub/sub -> FastAPI WebSocket -> browser
-                              |               |
-                              |               +-> delay model
-                              +------------------> graph engine
-
-PostgreSQL support exists for historical events and active-flight state, but persistence is not yet connected to the ingestion worker.
+   ingestion worker ──┬──> Redis pub/sub ──> FastAPI WebSocket ──> React/D3 browser
+                       │                            |      |
+                       │                            |      +──> delay model
+                       │                            +──────────> graph engine
+                       v
+                  PostgreSQL (flight_events, active_flights)
 ```
+
+`graph_engine.load_from_db()` reloads `active_flights` into memory on backend
+startup; `GraphEngine.prune_expired_flights()` removes landed flights more
+than 24 hours old from the in-memory graph (Postgres rows are not pruned).
 
 ## Prerequisites
 
@@ -108,7 +112,11 @@ cd frontend
 npm start
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:3000`. The frontend expects the backend at
+`http://localhost:8000` (uvicorn's default) and fetches `/api/config`, then
+connects to `/ws/{airport_code}` for live flight updates. If the backend
+runs somewhere else, set `REACT_APP_BACKEND_URL` before starting the dev
+server, e.g. `REACT_APP_BACKEND_URL=http://localhost:9000 npm start`.
 
 ## Tests and checks
 
@@ -132,19 +140,17 @@ There is not yet a backend unit-test suite. `test_api.py` is a manual live integ
 
 This is a functional prototype, not yet a production-ready end-to-end tracker.
 
-- The map UI works independently but currently generates its own mock flights and does not connect to the backend WebSocket.
+- The map UI connects to the backend's `/ws/{airport_code}` WebSocket and renders live flight events, with automatic reconnect; it no longer generates its own mock flights.
 - The backend pipeline is implemented, but it depends on running PostgreSQL and Redis services.
-- Live ingestion publishes events to Redis but does not currently persist them through the database writer.
-- Database schema creation exists but is not wired into normal server startup or a migration command.
-- Python dependencies are not declared in `setup.py` or a requirements/lock file.
-- Backend automated tests, deployment configuration, authentication, observability, and robust error handling are still missing.
-- The included ML model is ignored by Git, so a fresh clone may require retraining with `ml/train.py` and the source CSV.
-- CORS is configured only for the local React development server.
+- The ingestion worker persists every polled snapshot to PostgreSQL (`flight_events` + `active_flights`) and ensures the schema exists on startup, but nothing prunes old rows from Postgres itself — only the in-memory graph is pruned.
+- Backend automated tests, deployment configuration, authentication, and observability are still missing. The frontend has a small Jest/RTL test suite; the backend does not.
+- The included ML model is ignored by Git, so a fresh clone requires retraining with `ml/train.py` (paths are resolved relative to the script, not hardcoded) and the source CSV.
+- CORS is configured only for the local React development server (`http://localhost:3000`).
 
 ## Recommended next steps
 
-1. Connect `FlightMap` to `/ws/{airport_code}` and use backend events instead of frontend-only generated flights.
-2. Add a requirements file or modern `pyproject.toml`, plus database migrations.
-3. Add backend unit/integration tests for parsing, graph propagation, and ingestion safety.
-4. Make PostgreSQL/Redis startup reproducible with Docker Compose.
-5. Add rate limits, usage monitoring, and budget alerts before considering live API access again.
+1. Add a backend automated test suite (pytest) for graph propagation, event parsing, and ingestion safety.
+2. Add database migrations and a cleanup job/TTL for `flight_events` and `active_flights` in Postgres.
+3. Make PostgreSQL/Redis startup reproducible with Docker Compose.
+4. Add authentication and rate limiting before deploying anywhere shared.
+5. Add usage monitoring and budget alerts before considering live FlightAware API access again.

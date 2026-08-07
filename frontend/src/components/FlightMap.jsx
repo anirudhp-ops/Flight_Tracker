@@ -1,6 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
 import * as topojson from "topojson-client";
+
+// Same-origin (CRA dev server) can't reach the FastAPI backend directly —
+// it runs on a different port. Override with REACT_APP_BACKEND_URL if the
+// backend isn't at the default uvicorn address.
+const BACKEND_HTTP_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:8000";
+const BACKEND_WS_URL = BACKEND_HTTP_URL.replace(/^http/, "ws");
+const RECONNECT_DELAY_MS = 3000;
 
 const airports = {
   // ── US West Coast ──
@@ -78,7 +85,6 @@ function getIATACode(icaoOrIata) {
 
 function planeColor(f, selected) {
   if (selected) return "#79c0ff";
-  if (f.propagated) return "#e3b341";
   if (f.delay_minutes > 0) return "#ff7b72";
   return "#56d364";
 }
@@ -120,68 +126,22 @@ function flightPosition(f) {
   return Math.max(0.05, Math.min(0.95, t));
 }
 
-const AIRLINES = [
-  {code:"UA",name:"United"},   {code:"AA",name:"American"}, {code:"DL",name:"Delta"},
-  {code:"WN",name:"Southwest"},{code:"AS",name:"Alaska"},   {code:"B6",name:"JetBlue"},
-  {code:"F9",name:"Frontier"}, {code:"NK",name:"Spirit"},   {code:"HA",name:"Hawaiian"},
-  {code:"OO",name:"SkyWest"},
-];
-const IATA_LIST = Object.keys(airports).filter(a => a !== "SFO");
-
-function generateMockFlights() {
-  const now = Date.now();
-  const flights = [];
-
-  for (let i = 0; i < 100; i++) {
-    const airline = AIRLINES[i % AIRLINES.length];
-    const flightNum = String(100 + Math.floor(Math.random() * 9800));
-    const isDeparture = i < 50;
-    const other = IATA_LIST[Math.floor(Math.random() * IATA_LIST.length)];
-
-    // origin / destination — SFO is always one end
-    const origin = isDeparture ? "SFO" : other;
-    const destination = isDeparture ? other : "SFO";
-
-    // Departure time: -4h to +6h from now so planes are at various arc positions
-    const depOffsetMs = (Math.random() * 10 - 4) * 3_600_000;
-    const depTime = now + depOffsetMs;
-
-    // Flight duration: 1 – 12 hours depending on rough distance
-    const durationHrs = 1 + Math.random() * 11;
-    const arrTime = depTime + durationHrs * 3_600_000;
-
-    const delay = Math.random() < 0.3 ? Math.floor(10 + Math.random() * 110) : 0;
-
-    const progress = (now - depTime) / (arrTime - depTime);
-    const status = progress > 0.98 ? "landed" : progress > 0 ? "active" : "scheduled";
-
-    const terminals = ["A","B","C","D","E","G","I"];
-    const gate = `${terminals[Math.floor(Math.random()*terminals.length)]}${Math.floor(1+Math.random()*30)}`;
-
-    flights.push({
-      flight_key:          `${airline.code}${flightNum}-mock-${i}`,
-      flight_id:           `${airline.code}${flightNum}-mock-${i}`,
-      airline_code:        airline.code,
-      flight_number:       flightNum,
-      origin,
-      destination,
-      aircraft_id:         `N${Math.floor(10000 + Math.random() * 89999)}`,
-      gate_id:             gate,
-      scheduled_departure: new Date(depTime).toISOString(),
-      scheduled_arrival:   new Date(arrTime).toISOString(),
-      delay_minutes:       delay,
-      status,
-      propagated:          false,
-    });
-  }
-  return flights;
-}
+const STATUS_BADGE = {
+  connecting: { label: "● Connecting…", bg: "#2d2410", fg: "#e3b341" },
+  open: { label: "● Live", bg: "#1a2a1a", fg: "#56d364" },
+  closed: { label: "● Reconnecting…", bg: "#2d2410", fg: "#e3b341" },
+  error: { label: "● Connection error", bg: "#3d1515", fg: "#ff7b72" },
+};
 
 export default function FlightMap() {
   const svgRef = useRef(null);
   const [selected, setSelected] = useState(null);
   const [worldData, setWorldData] = useState(null);
-  const [flights] = useState(() => generateMockFlights());
+  const [targetAirport, setTargetAirport] = useState(null);
+  const [connectionStatus, setConnectionStatus] = useState("connecting");
+  const [flightsById, setFlightsById] = useState({});
+
+  const flights = useMemo(() => Object.values(flightsById), [flightsById]);
 
   // load world map once
   useEffect(() => {
@@ -195,6 +155,66 @@ export default function FlightMap() {
           .then(setWorldData);
       });
   }, []);
+
+  // fetch which airport the backend is tracking
+  useEffect(() => {
+    fetch(`${BACKEND_HTTP_URL}/api/config`)
+      .then(r => r.json())
+      .then(cfg => setTargetAirport(cfg.target_airport))
+      .catch(err => {
+        console.error("Failed to load backend config:", err);
+        setConnectionStatus("error");
+      });
+  }, []);
+
+  // connect to the backend's live flight stream, with reconnect on drop
+  useEffect(() => {
+    if (!targetAirport) return;
+
+    let socket;
+    let reconnectTimer;
+    let stopped = false;
+
+    function connect() {
+      setConnectionStatus("connecting");
+      socket = new WebSocket(`${BACKEND_WS_URL}/ws/${targetAirport}`);
+
+      socket.onopen = () => {
+        if (stopped) return;
+        setConnectionStatus("open");
+      };
+
+      socket.onmessage = (evt) => {
+        if (stopped) return;
+        try {
+          const flight = JSON.parse(evt.data);
+          setFlightsById(prev => ({ ...prev, [flight.flight_id]: flight }));
+        } catch (err) {
+          console.error("Failed to parse flight event:", err);
+        }
+      };
+
+      socket.onclose = () => {
+        if (stopped) return;
+        setConnectionStatus("closed");
+        reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+      };
+
+      socket.onerror = () => {
+        if (stopped) return;
+        setConnectionStatus("error");
+        socket.close();
+      };
+    }
+
+    connect();
+
+    return () => {
+      stopped = true;
+      clearTimeout(reconnectTimer);
+      if (socket) socket.close();
+    };
+  }, [targetAirport]);
 
   // d3 render
   useEffect(() => {
@@ -223,7 +243,7 @@ export default function FlightMap() {
     const apG = svg.append("g");
     const planeG = svg.append("g");
 
-    const displayFlights = flights.length > 0 ? flights : [];
+    const displayFlights = flights;
 
     displayFlights.forEach(f => {
       const p1 = project(f.origin), p2 = project(f.destination);
@@ -261,13 +281,13 @@ export default function FlightMap() {
       const pos = bezierPoint(p1, ctrl, p2, t);
       const tan = bezierTangent(p1, ctrl, p2, t);
       const angle = Math.atan2(tan[1], tan[0]) * 180 / Math.PI + 90;
-      const isSel = selected === f.flight_key;
+      const isSel = selected === f.flight_id;
       const col = planeColor(f, isSel);
 
       const g = planeG.append("g")
         .attr("transform", `translate(${pos[0]},${pos[1]})`)
         .attr("cursor", "pointer")
-        .on("click", () => setSelected(prev => prev === f.flight_key ? null : f.flight_key));
+        .on("click", () => setSelected(prev => prev === f.flight_id ? null : f.flight_id));
 
       if (isSel) {
         g.append("circle").attr("r", 13).attr("fill", "none")
@@ -289,24 +309,31 @@ export default function FlightMap() {
 
   }, [worldData, flights, selected]);
 
-  const selectedFlight = flights.find(f => f.flight_key === selected);
+  const selectedFlight = flights.find(f => f.flight_id === selected);
   const delayed = flights.filter(f => f.delay_minutes > 0).length;
   const total = flights.length;
+  const airportLabel = targetAirport ? getIATACode(targetAirport) : "…";
+  const badge = STATUS_BADGE[connectionStatus] || STATUS_BADGE.connecting;
 
   return (
     <div style={{background:"#0d1117",borderRadius:12,overflow:"hidden",border:"0.5px solid #30363d",fontFamily:"sans-serif",color:"#e6edf3"}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",background:"#161b22",borderBottom:"0.5px solid #30363d"}}>
         <div style={{display:"flex",alignItems:"center",gap:10}}>
-          <span style={{fontSize:13,fontWeight:500}}>FlightTracker — SFO</span>
+          <span style={{fontSize:13,fontWeight:500}}>FlightTracker — {airportLabel}</span>
           <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#0d1f3c",color:"#79c0ff"}}>{total} flights</span>
           <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#3d1515",color:"#ff7b72"}}>{delayed} delayed</span>
-          <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#1a2a1a",color:"#56d364"}}>● Mock data</span>
+          <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:badge.bg,color:badge.fg}}>{badge.label}</span>
         </div>
         <span style={{fontSize:11,color:"#8b949e"}}>Click a plane to inspect</span>
       </div>
 
       <div style={{position:"relative"}}>
         <svg ref={svgRef} style={{width:"100%",height:480,display:"block"}} />
+        {total === 0 && (
+          <div style={{position:"absolute",top:12,left:12,fontSize:12,color:"#8b949e",background:"#161b22cc",border:"0.5px solid #30363d",borderRadius:8,padding:"6px 10px"}}>
+            {connectionStatus === "error" ? "Can't reach the backend." : "Waiting for flights from the backend…"}
+          </div>
+        )}
         <div style={{position:"absolute",top:12,right:12,width:230,background:"#161b22cc",border:"0.5px solid #30363d",borderRadius:8,overflow:"hidden"}}>
           <div style={{padding:"8px 12px",borderBottom:"0.5px solid #30363d",fontSize:11,color:"#8b949e",textTransform:"uppercase",letterSpacing:".07em"}}>Flight detail</div>
           <div style={{padding:"10px 12px"}}>
@@ -316,7 +343,7 @@ export default function FlightMap() {
               <>
                 {[
                   ["Flight", `${selectedFlight.airline_code}${selectedFlight.flight_number}`],
-                  ["Route", `${selectedFlight.origin} → ${selectedFlight.destination}`],
+                  ["Route", `${getIATACode(selectedFlight.origin)} → ${getIATACode(selectedFlight.destination)}`],
                   ["Aircraft", selectedFlight.aircraft_id || "N/A"],
                   ["Gate", selectedFlight.gate_id || "N/A"],
                   ["Status", selectedFlight.status],
