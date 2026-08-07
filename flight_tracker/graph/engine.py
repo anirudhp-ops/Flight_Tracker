@@ -139,7 +139,10 @@ class GraphEngine:
         used_gates = {attrs["gate_id"] for _, attrs in self.graph.nodes(data=True) if attrs["gate_id"]}
         reassignments = []
 
-        for src, dst, data in self.graph.edges(data=True):
+        # Snapshot as a list: the loop below calls self.graph.remove_edge(),
+        # and iterating the live edge view while mutating it raises
+        # "RuntimeError: dictionary changed size during iteration".
+        for src, dst, data in list(self.graph.edges(data=True)):
             if data.get("type") != "gate_reuse":
                 continue
 

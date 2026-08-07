@@ -85,7 +85,7 @@ async def shutdown():
 @app.websocket("/ws/{airport_code}")
 async def websocket_endpoint(websocket: WebSocket, airport_code: str):
     await websocket.accept()
-    
+
     # Send all currently active flights in graph_engine to the client upon connection
     for node, attrs in graph_engine.graph.nodes(data=True):
         event_obj = attrs.get("event")
@@ -94,11 +94,22 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
 
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(f"flights:{airport_code}")
-    try:
+
+    async def watch_for_disconnect():
+        # stream_events() below only ever writes to the socket — it never
+        # reads from it, so without this, a closed browser tab is invisible
+        # to the server until the next send_text() happens to fail (up to
+        # POLL_INTERVAL_SECONDS later, or never, if no more events arrive).
+        # receive_text() raises WebSocketDisconnect the moment the client
+        # actually closes.
+        while True:
+            await websocket.receive_text()
+
+    async def stream_events():
         async for message in pubsub.listen():
             if message["type"] == "message":
                 event = FlightEvent.model_validate_json(message["data"])
-                
+
                 # Add or update the flight event in the graph engine
                 graph_engine.process_event(event)
 
@@ -133,5 +144,21 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
 
                 await websocket.send_text(event.model_dump_json())
 
-    except WebSocketDisconnect:
+    receiver_task = asyncio.create_task(watch_for_disconnect())
+    streamer_task = asyncio.create_task(stream_events())
+    try:
+        done, _ = await asyncio.wait(
+            {receiver_task, streamer_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        for task in (receiver_task, streamer_task):
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(receiver_task, streamer_task, return_exceptions=True)
         await pubsub.unsubscribe(f"flights:{airport_code}")
+
+    for result in results:
+        if isinstance(result, Exception) and not isinstance(
+            result, (WebSocketDisconnect, asyncio.CancelledError)
+        ):
+            print(f"WebSocket handler for {airport_code} exited due to: {result!r}")
