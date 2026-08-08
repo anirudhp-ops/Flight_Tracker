@@ -2,7 +2,12 @@ import asyncio
 from datetime import datetime, timezone
 
 from flight_tracker.config import settings
-from flight_tracker.db.writer import create_pool, ensure_schema, write_events
+from flight_tracker.db.writer import (
+    cleanup_stale_active_flights,
+    create_pool,
+    ensure_schema,
+    write_events,
+)
 from flight_tracker.graph.engine import GraphEngine
 from flight_tracker.ingestion.publisher import RedisPublisher
 
@@ -26,6 +31,7 @@ async def run(
     try:
         await ensure_schema(pool)
         last_prune = datetime.now(timezone.utc)
+        last_db_cleanup = datetime.now(timezone.utc)
         # Fire immediately on startup so the map is populated right away,
         # then repeat every poll_interval seconds.
         while True:
@@ -33,7 +39,7 @@ async def run(
                 snapshot = await client.get_airport_flights(airport_code)
                 for event in snapshot.flights:
                     await publisher.publish(event, airport_code)
-                written = await write_events(pool, snapshot.flights)
+                written = await write_events(pool, snapshot.flights, airport_code=airport_code)
                 print(
                     f"Ingestion: published {len(snapshot.flights)} flights for "
                     f"{airport_code}, persisted {written} to Postgres"
@@ -50,6 +56,19 @@ async def run(
                         f"ago from the graph"
                     )
                 last_prune = now
+
+            if (now - last_db_cleanup).total_seconds() >= settings.db_cleanup_interval_seconds:
+                deleted = await cleanup_stale_active_flights(
+                    pool, max_age_hours=settings.db_cleanup_max_age_hours
+                )
+                async with pool.acquire() as conn:
+                    events_count = await conn.fetchval("SELECT count(*) FROM flight_events")
+                print(
+                    f"DB cleanup: deleted {deleted} landed flights older than "
+                    f"{settings.db_cleanup_max_age_hours}h from active_flights "
+                    f"(flight_events now has {events_count} rows, not archived)"
+                )
+                last_db_cleanup = now
 
             await asyncio.sleep(poll_interval)
     finally:

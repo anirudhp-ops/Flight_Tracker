@@ -44,9 +44,22 @@ class GraphEngine:
                     if overlaps:
                          self.graph.add_edge(node_key, new_flight.flight_key, type="gate_reuse")
     
-    async def load_from_db(self, pool) -> None:
+    async def load_from_db(self, pool, airport_code: str | None = None) -> None:
+        """
+        airport_code scopes the load to one tracked airport, using the
+        idx_active_flights_airport_code_last_updated index. Without it, a
+        database that has ever tracked more than one airport (or accumulated
+        old rows from manual/test runs against a different TARGET_AIRPORT)
+        would load unrelated flights into this graph.
+        """
         async with pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM active_flights")
+            if airport_code is not None:
+                rows = await conn.fetch(
+                    "SELECT * FROM active_flights WHERE airport_code = $1 ORDER BY last_updated DESC",
+                    airport_code,
+                )
+            else:
+                rows = await conn.fetch("SELECT * FROM active_flights")
             for row in rows:
                 event = FlightEvent(
                     flight_id=row["flight_id"],

@@ -2,9 +2,11 @@ import asyncio
 from pathlib import Path
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from flight_tracker.cache.redis_cache import CacheLayer
 from flight_tracker.config import settings
+from flight_tracker.db import reader as db_reader
 from flight_tracker.db.writer import create_pool
 from flight_tracker.models.events import FlightEvent
 from flight_tracker.graph.engine import GraphEngine
@@ -28,12 +30,77 @@ app.add_middleware(
 async def get_config():
     return {"target_airport": settings.target_airport}
 
+
+@app.get("/health/db")
+async def health_db():
+    result = {
+        "active_flights_rows": None,
+        "flight_events_rows": None,
+        "redis": "unknown",
+        "pool": None,
+    }
+
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                result["active_flights_rows"] = await conn.fetchval("SELECT count(*) FROM active_flights")
+                result["flight_events_rows"] = await conn.fetchval("SELECT count(*) FROM flight_events")
+        except Exception as e:
+            result["db_error"] = repr(e)
+        result["pool"] = {
+            "size": db_pool.get_size(),
+            "min_size": db_pool.get_min_size(),
+            "max_size": db_pool.get_max_size(),
+            "idle": db_pool.get_idle_size(),
+        }
+    else:
+        result["db_error"] = "pool not initialized"
+
+    try:
+        pong = await redis_client.ping()
+        result["redis"] = "ok" if pong else "no response"
+    except Exception as e:
+        result["redis"] = f"error: {e!r}"
+
+    return result
+
 graph_engine = GraphEngine()
 redis_client = aioredis.from_url(f"redis://{settings.redis_host}:{settings.redis_port}")
 predictor = DelayPredictor(str(Path(__file__).resolve().parent.parent / "ml" / "model.pkl"))
+cache = CacheLayer(redis_client)
 
 db_pool = None
 worker_task = None
+
+
+@app.get("/api/flights/{flight_id}")
+async def get_flight_status(flight_id: str):
+    """Cache-aside: current status of one flight. TTL 5 min (settings.cache_flight_ttl_seconds)."""
+    async def loader():
+        return await db_reader.get_flight_status(db_pool, flight_id)
+
+    result = await cache.get_or_set(cache.key_flight(flight_id), settings.cache_flight_ttl_seconds, loader)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"No flight found for flight_id={flight_id}")
+    return result
+
+
+@app.get("/api/airports/{airport_code}/snapshot")
+async def get_airport_snapshot(airport_code: str):
+    """Cache-aside: all active flights for one airport. TTL 10 min (settings.cache_airport_ttl_seconds)."""
+    async def loader():
+        return await db_reader.get_airport_snapshot(db_pool, airport_code)
+
+    return await cache.get_or_set(cache.key_airport(airport_code), settings.cache_airport_ttl_seconds, loader)
+
+
+@app.get("/api/flights/{flight_id}/delays")
+async def get_flight_delays(flight_id: str):
+    """Cache-aside: recent delay events for one flight. TTL 2 min (settings.cache_delays_ttl_seconds)."""
+    async def loader():
+        return await db_reader.get_recent_delays(db_pool, flight_id)
+
+    return await cache.get_or_set(cache.key_delays(flight_id), settings.cache_delays_ttl_seconds, loader)
 
 
 def _on_worker_done(task: asyncio.Task) -> None:
@@ -49,7 +116,7 @@ def _on_worker_done(task: asyncio.Task) -> None:
 async def startup():
     global db_pool, worker_task
     db_pool = await create_pool()
-    await graph_engine.load_from_db(db_pool)
+    await graph_engine.load_from_db(db_pool, airport_code=settings.target_airport)
 
     if settings.live_api_enabled:
         client = FlightAwareClient(settings.flightaware_api_key)

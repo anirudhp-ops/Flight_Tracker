@@ -12,7 +12,7 @@ inside the ingestion worker or a DB call.
 """
 from typing import Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,6 +46,23 @@ class Settings(BaseSettings):
     db_user: str = "postgres"
     db_password: Optional[str] = None
 
+    # asyncpg pool sizing — see flight_tracker/db/OPTIMIZATION.md for the
+    # rationale behind these specific numbers (min/max size, connection
+    # recycling via max_queries, prepared-statement cache lifetime).
+    db_pool_min_size: int = Field(default=10, gt=0)
+    db_pool_max_size: int = Field(default=20, gt=0)
+    db_pool_max_queries: int = Field(default=50000, gt=0)
+    db_pool_max_cached_statement_lifetime: int = Field(default=300, ge=0)
+
+    # --- Redis cache-aside layer (flight_tracker/cache/redis_cache.py) -----
+    cache_flight_ttl_seconds: int = Field(default=300, gt=0)    # 5 min
+    cache_airport_ttl_seconds: int = Field(default=600, gt=0)   # 10 min
+    cache_delays_ttl_seconds: int = Field(default=120, gt=0)    # 2 min
+
+    # How often the background job deletes long-landed rows from Postgres.
+    db_cleanup_interval_seconds: int = Field(default=3600, gt=0)  # 1 hour
+    db_cleanup_max_age_hours: float = Field(default=24, gt=0)
+
     @field_validator("enable_flightaware_api", mode="before")
     @classmethod
     def _parse_truthy_string(cls, v):
@@ -53,6 +70,15 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return v.strip().lower() in {"1", "true", "yes", "on"}
         return v
+
+    @model_validator(mode="after")
+    def _pool_max_at_least_min(self):
+        if self.db_pool_max_size < self.db_pool_min_size:
+            raise ValueError(
+                f"db_pool_max_size ({self.db_pool_max_size}) must be >= "
+                f"db_pool_min_size ({self.db_pool_min_size})"
+            )
+        return self
 
     @property
     def live_api_enabled(self) -> bool:
