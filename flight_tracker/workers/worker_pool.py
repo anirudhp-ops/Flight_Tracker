@@ -21,7 +21,6 @@ from aiokafka.abc import ConsumerRebalanceListener
 from flight_tracker.config import settings
 from flight_tracker.events.event_model import FlightEventEnvelope
 from flight_tracker.events.kafka_producer import KafkaEventProducer
-from flight_tracker.graph.engine import GraphEngine
 from flight_tracker.workers.event_processor import AsyncEventProcessor
 from flight_tracker.workers.failure_handler import FailureHandler
 
@@ -223,21 +222,20 @@ class WorkerPool:
 def build_worker_pool(
     pool,
     redis_client: aioredis.Redis,
-    graph_engine: GraphEngine,
-    predictor,
     processed_producer: KafkaEventProducer,
-    prediction_producer: KafkaEventProducer,
     airport_code: str,
     worker_count: int | None = None,
 ) -> WorkerPool:
     """
     Constructs WORKER_COUNT Workers, each with its own AsyncEventProcessor
-    (own metrics) but all sharing one asyncpg pool, one GraphEngine + one
-    asyncio.Lock guarding it, one predictor, and the given producers — the
-    shared-vs-per-worker split described in event_processor.py's docstring.
+    (own metrics) but all sharing one asyncpg pool and the given producer —
+    the shared-vs-per-worker split described in event_processor.py's
+    docstring. No GraphEngine/lock/predictor here anymore (Phase F): this
+    pool is pure persistence, and the graph-owning work moved to
+    flight_tracker/workers/delay_propagation_worker.py's single-instance
+    DelayPropagationWorker.
     """
     n = worker_count if worker_count is not None else settings.worker_count
-    graph_lock = asyncio.Lock()
     workers = []
     for i in range(n):
         worker_id = f"worker-{i}"
@@ -245,11 +243,7 @@ def build_worker_pool(
             worker_id=worker_id,
             pool=pool,
             redis_client=redis_client,
-            graph_engine=graph_engine,
-            graph_lock=graph_lock,
-            predictor=predictor,
             processed_producer=processed_producer,
-            prediction_producer=prediction_producer,
             airport_code=airport_code,
         )
         workers.append(Worker(worker_id=worker_id, processor=processor))

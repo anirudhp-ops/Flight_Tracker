@@ -10,7 +10,7 @@ An invalid or missing required value raises a pydantic ValidationError at
 import time, naming the offending field, instead of failing later deep
 inside the ingestion worker or a DB call.
 """
-from typing import Optional
+from typing import Dict, List, Optional
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -111,6 +111,17 @@ class Settings(BaseSettings):
 
     worker_supervisor_restart_delay_seconds: float = Field(default=5.0, ge=0)
     worker_shutdown_timeout_seconds: float = Field(default=30.0, gt=0)
+
+    # --- Gate pool (flight_tracker/graph/engine.py resolve_gate_conflicts) --
+    # Default pool: terminals x gates-per-terminal, e.g. A1-A14, B1-B14,
+    # C1-C14, T1-T14 = 56 gates with the defaults below. GATE_POOL_OVERRIDES
+    # is a per-airport override (JSON dict env var, e.g.
+    # GATE_POOL_OVERRIDES={"KJFK":["A1","A2","B1"]}) for an airport whose
+    # real gate layout doesn't match the generated default — checked first,
+    # falls back to the generated pool if the current airport isn't listed.
+    gate_pool_terminals: List[str] = Field(default_factory=lambda: ["A", "B", "C", "T"])
+    gate_pool_gates_per_terminal: int = Field(default=14, gt=0)
+    gate_pool_overrides: Dict[str, List[str]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _backpressure_thresholds_sane(self):

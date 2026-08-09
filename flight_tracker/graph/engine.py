@@ -2,12 +2,18 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 
 import networkx as nx
+from flight_tracker.config import settings
 from flight_tracker.models.events import FlightEvent, EventType, FlightStatus
 
 
 class GraphEngine:
-    def __init__(self):
+    def __init__(self, airport_code: str | None = None):
         self.graph = nx.DiGraph()
+        # Used only to pick a gate pool (settings.gate_pool_overrides) in
+        # resolve_gate_conflicts() — the graph itself doesn't otherwise
+        # filter or scope by airport; that happens once, at load_from_db()
+        # time, via its own airport_code argument.
+        self.airport_code = airport_code or settings.target_airport
     
     def add_flight(self, flight: FlightEvent) -> None:
         self.graph.add_node(
@@ -85,14 +91,23 @@ class GraphEngine:
         self.add_edges_for_flight(event)
     
 
-    def propagate_delay(self, flight_key: str, delay_minutes: int) -> list[FlightEvent]:
+    def propagate_delay(self, flight_key: str, delay_minutes: int) -> list[tuple[FlightEvent, int]]:
+        """
+        Unchanged from the original: BFS from `flight_key`, delay decays by
+        0.75 per hop, each neighbor's delay is max()-merged with whatever it
+        already had (never regresses a larger existing delay). The only
+        addition is tracking and returning each updated event's hop
+        distance from the source alongside it — needed for
+        PredictionEvent.propagation_hops (flight_tracker/models/prediction_event.py)
+        — the traversal/decay/merge logic itself is untouched.
+        """
         queue = deque()
-        queue.append((flight_key, delay_minutes))
+        queue.append((flight_key, delay_minutes, 0))
         visited = set()
-        updated_events = []
+        updated_events: list[tuple[FlightEvent, int]] = []
 
         while queue:
-            current_key, current_delay = queue.popleft()
+            current_key, current_delay, hops = queue.popleft()
             if current_key in visited:
                 continue
             visited.add(current_key)
@@ -106,7 +121,8 @@ class GraphEngine:
                 neighbor_delay = self.graph.nodes[neighbor_key]["delay_minutes"]
                 propagated = int(current_delay * 0.75)
                 new_delay = max(neighbor_delay, propagated)
-                
+                neighbor_hops = hops + 1
+
                 if new_delay != neighbor_delay:
                     self.graph.nodes[neighbor_key]["delay_minutes"] = new_delay
                     if "event" in self.graph.nodes[neighbor_key]:
@@ -114,9 +130,9 @@ class GraphEngine:
                         event_obj.delay_minutes = new_delay
                         if new_delay > 0:
                             event_obj.event_type = EventType.DELAY
-                        updated_events.append(event_obj)
-                
-                queue.append((neighbor_key, new_delay))
+                        updated_events.append((event_obj, neighbor_hops))
+
+                queue.append((neighbor_key, new_delay, neighbor_hops))
         return updated_events
                 
     def prune_expired_flights(self, max_age_hours: float = 24) -> list[str]:
@@ -147,8 +163,25 @@ class GraphEngine:
 
         return expired
 
+    def _gate_pool(self) -> list[str]:
+        """
+        settings.gate_pool_overrides[self.airport_code] if the current
+        airport has a real, hand-specified gate layout configured;
+        otherwise the generated terminals x gates-per-terminal pool
+        (A1-A14, B1-B14, C1-C14, T1-T14 with the defaults — same 56 gates
+        as the original hardcoded pool this replaces).
+        """
+        override = settings.gate_pool_overrides.get(self.airport_code)
+        if override:
+            return override
+        return [
+            f"{terminal}{num}"
+            for terminal in settings.gate_pool_terminals
+            for num in range(1, settings.gate_pool_gates_per_terminal + 1)
+        ]
+
     def resolve_gate_conflicts(self) -> list[dict]:
-        gate_pool = [f"{terminal}{num}" for terminal in ["A","B","C","T"] for num in range(1,15)]
+        gate_pool = self._gate_pool()
         used_gates = {attrs["gate_id"] for _, attrs in self.graph.nodes(data=True) if attrs["gate_id"]}
         reassignments = []
 

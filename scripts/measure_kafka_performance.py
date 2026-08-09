@@ -4,8 +4,9 @@ Live measurement of the Kafka pipeline's latency, throughput, and consumer
 lag under load, against the real local broker/Postgres/Redis — and a real
 (isolated) Redis pub/sub latency baseline for comparison. Requires the full
 server (uvicorn flight_tracker.server:app) already running, since latency
-is measured end-to-end through consumer_runner + delay_prediction_consumer
-+ a real /ws/{airport} connection, not simulated.
+is measured end-to-end through the Phase E persistence worker pool + the
+Phase F DelayPropagationWorker + a real /ws/{airport} connection, not
+simulated.
 
 Usage: python scripts/measure_kafka_performance.py
 """
@@ -70,9 +71,9 @@ async def kafka_pipeline_latency() -> list[float]:
     creation time), then reads them off the actual /ws/KJFK WebSocket —
     the same endpoint the frontend uses — measuring wall-clock time from
     "event created" to "received over the WebSocket." Spans the full
-    pipeline: flight-events -> consumer_runner (DB write) -> processed-
-    flights -> delay_prediction_consumer (graph + ML) -> delay-predictions
-    -> this WebSocket connection.
+    pipeline: flight-events -> Phase E worker pool (DB write) -> processed-
+    flights -> DelayPropagationWorker (graph + ML) -> delay-predictions ->
+    this WebSocket connection.
     """
     producer = KafkaEventProducer()
     await producer.start()
@@ -139,10 +140,10 @@ async def kafka_pipeline_latency() -> list[float]:
 
 async def sample_consumer_group_lag(group_id: str) -> int:
     """
-    Real lag for the actual running flight-processor group, via the same
-    CLI Kafka ships (kafka-consumer-groups --describe) — reading group
-    metadata as an outside observer, not by joining the group (which would
-    steal partitions from the real consumer and invalidate the measurement).
+    Real lag for the actual running consumer group, via the same CLI Kafka
+    ships (kafka-consumer-groups --describe) — reading group metadata as an
+    outside observer, not by joining the group (which would steal
+    partitions from the real consumer and invalidate the measurement).
     """
     proc = await asyncio.create_subprocess_exec(
         "kafka-consumer-groups", "--bootstrap-server", settings.kafka_bootstrap_servers,
@@ -170,10 +171,12 @@ async def throughput_and_lag() -> None:
     throughput ceiling rather than the artificial one imposed by awaiting
     each acks="all" round-trip sequentially before starting the next. Then
     tight-polls (no fixed sleep) the DB row count for those events — what
-    flight-processor's handler writes right before committing — to find the
-    real drain time at sub-10ms resolution, and samples the real
-    flight-processor consumer group's lag right after the burst completes,
-    to see whether it actually backed up under load.
+    the Phase E worker pool's persistence handler writes right before
+    committing — to find the real drain time at sub-10ms resolution, and
+    samples the worker pool's actual consumer group
+    (settings.kafka_consumer_group_worker_pool, "event-processor-pool")
+    lag right after the burst completes, to see whether it actually backed
+    up under load.
     """
     from flight_tracker.db.writer import create_pool
 
@@ -197,13 +200,13 @@ async def throughput_and_lag() -> None:
         *(producer.publish(settings.kafka_topic_flight_events, env) for env in envelopes)
     )
     publish_elapsed = time.perf_counter() - t0
-    lag_right_after_burst = await sample_consumer_group_lag(settings.kafka_consumer_group_processor)
+    lag_right_after_burst = await sample_consumer_group_lag(settings.kafka_consumer_group_worker_pool)
     await producer.stop()
     print(
         f"Published {THROUGHPUT_BURST_SIZE} events concurrently in {publish_elapsed:.3f}s "
         f"({THROUGHPUT_BURST_SIZE / publish_elapsed:.1f} events/sec produced)"
     )
-    print(f"flight-processor lag immediately after burst completed: {lag_right_after_burst} messages")
+    print(f"{settings.kafka_consumer_group_worker_pool} lag immediately after burst completed: {lag_right_after_burst} messages")
 
     t0 = time.perf_counter()
     deadline = t0 + 30
@@ -216,14 +219,14 @@ async def throughput_and_lag() -> None:
             break
         await asyncio.sleep(0.01)
     drain_elapsed = time.perf_counter() - t0
-    final_lag = await sample_consumer_group_lag(settings.kafka_consumer_group_processor)
+    final_lag = await sample_consumer_group_lag(settings.kafka_consumer_group_worker_pool)
     await pool.close()
 
     print(
-        f"flight-processor drained {processed}/{THROUGHPUT_BURST_SIZE} burst events "
+        f"{settings.kafka_consumer_group_worker_pool} drained {processed}/{THROUGHPUT_BURST_SIZE} burst events "
         f"in {drain_elapsed:.3f}s ({processed / drain_elapsed:.1f} events/sec consumed+written)"
     )
-    print(f"flight-processor lag after drain: {final_lag} messages (0 = fully caught up)")
+    print(f"{settings.kafka_consumer_group_worker_pool} lag after drain: {final_lag} messages (0 = fully caught up)")
 
 
 async def main():

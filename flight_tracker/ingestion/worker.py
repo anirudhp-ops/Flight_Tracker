@@ -10,9 +10,11 @@ async def run(client, producer: KafkaEventProducer, airport_code: str) -> None:
     Fetches flights from `client` (mock or live) and publishes each one to
     the flight-events Kafka topic. That's the whole job now — this worker no
     longer touches Postgres or Redis directly. Persistence, graph
-    processing, and delay prediction all happen downstream, in Kafka
-    consumers (ingestion/consumer_runner.py, events/delay_prediction_consumer.py)
-    that read from the topic this worker writes to. See
+    processing, and delay prediction all happen downstream, in the two
+    supervised worker pools server.py starts (flight_tracker/workers/
+    worker_pool.py's persistence pool, flight_tracker/workers/
+    delay_propagation_worker.py's single-instance DelayPropagationWorker)
+    that consume from the topics this worker writes to and forwards to. See
     flight_tracker/events/KAFKA_ARCHITECTURE.md for the full picture.
     """
     poll_interval = settings.poll_interval_seconds

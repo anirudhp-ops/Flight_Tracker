@@ -11,13 +11,14 @@ from flight_tracker.config import settings
 from flight_tracker.db import reader as db_reader
 from flight_tracker.db.writer import create_pool
 from flight_tracker.events.dlq_utils import fetch_dlq_events
-from flight_tracker.events.event_model import FlightEventEnvelope
 from flight_tracker.events.kafka_producer import KafkaEventProducer
 from flight_tracker.graph.engine import GraphEngine
 from flight_tracker.ingestion.worker import run as worker_run
 from flight_tracker.ingestion.client import MockFlightAwareClient, FlightAwareClient
+from flight_tracker.models.prediction_event import PredictionEvent
+from flight_tracker.workers.delay_propagation_worker import build_delay_propagation_worker
 from flight_tracker.workers.supervisor import Supervisor
-from flight_tracker.workers.worker_pool import build_worker_pool
+from flight_tracker.workers.worker_pool import WorkerPool, build_worker_pool
 from ml.predictor import DelayPredictor
 
 app = FastAPI()
@@ -87,7 +88,7 @@ async def health_dlq():
         "warning": count > settings.kafka_dlq_warning_threshold,
     }
 
-graph_engine = GraphEngine()
+graph_engine = GraphEngine(airport_code=settings.target_airport)
 redis_client = aioredis.from_url(f"redis://{settings.redis_host}:{settings.redis_port}")
 predictor = DelayPredictor(str(Path(__file__).resolve().parent.parent / "ml" / "model.pkl"))
 cache = CacheLayer(redis_client)
@@ -98,13 +99,24 @@ kafka_producer = KafkaEventProducer()
 
 db_pool = None
 worker_task = None
-# Phase E's concurrent worker pool replaces Phase D's single-consumer
-# ingestion/consumer_runner.py + events/delay_prediction_consumer.py for
-# the hot path — both files are kept as reference/fallback but are not
-# started here, to avoid three separate things consuming (and, worse,
-# double-processing) the same topics. See flight_tracker/workers/CONCURRENCY.md.
+# Two independent, separately-supervised pipelines consume flight-events'
+# descendants — see flight_tracker/workers/CONCURRENCY.md and
+# flight_tracker/graph/STATE_MANAGEMENT.md for why they're split this way
+# rather than combined into one pipeline (as Phase D's single-consumer
+# ingestion/consumer_runner.py + events/delay_prediction_consumer.py did;
+# both files are deleted as of Phase F, fully superseded):
+#   - `supervisor`: Phase E's WORKER_COUNT concurrent Workers, persistence
+#     only (idempotency check -> DB write -> forward to processed-flights).
+#   - `delay_propagation_supervisor`: Phase F's single-instance
+#     DelayPropagationWorker, the only thing that owns/mutates graph_engine
+#     (processed-flights -> graph mutation/propagation/gate-conflicts/ML
+#     prediction -> delay-predictions). Single-instance because GraphEngine
+#     is process-wide in-memory state that can't be safely sharded across
+#     concurrent consumers — see delay_propagation_worker.py's docstring.
 supervisor: Supervisor | None = None
 metrics_log_task = None
+delay_propagation_supervisor: Supervisor | None = None
+delay_propagation_metrics_log_task = None
 
 
 @app.get("/api/flights/{flight_id}")
@@ -152,6 +164,7 @@ def _crash_logger(name: str):
 @app.on_event("startup")
 async def startup():
     global db_pool, worker_task, supervisor, metrics_log_task
+    global delay_propagation_supervisor, delay_propagation_metrics_log_task
     db_pool = await create_pool()
     await graph_engine.load_from_db(db_pool, airport_code=settings.target_airport)
     await kafka_producer.start()
@@ -171,9 +184,8 @@ async def startup():
     worker_task.add_done_callback(_crash_logger("ingestion worker"))
 
     # WORKER_COUNT concurrent workers consuming flight-events, supervised
-    # (crash -> log -> wait -> restart) — see
-    # flight_tracker/workers/CONCURRENCY.md for the full data flow and why
-    # this replaces Phase D's two single-consumer stages.
+    # (crash -> log -> wait -> restart), pure persistence as of Phase F —
+    # see flight_tracker/workers/CONCURRENCY.md for the full data flow.
     processed_producer = KafkaEventProducer()
     prediction_producer = KafkaEventProducer()
     await processed_producer.start()
@@ -181,10 +193,7 @@ async def startup():
     pool_obj = build_worker_pool(
         pool=db_pool,
         redis_client=redis_client,
-        graph_engine=graph_engine,
-        predictor=predictor,
         processed_producer=processed_producer,
-        prediction_producer=prediction_producer,
         airport_code=settings.target_airport,
     )
     supervisor = Supervisor(pool_obj)
@@ -192,6 +201,25 @@ async def startup():
     supervisor_task = asyncio.create_task(supervisor.run_forever())
     supervisor_task.add_done_callback(_crash_logger("worker pool supervisor"))
     metrics_log_task = asyncio.create_task(supervisor.run_periodic_metrics_logging())
+
+    # Single-instance DelayPropagationWorker, wrapped in its own
+    # WorkerPool/Supervisor for the same crash-restart supervision as the
+    # persistence pool above — see delay_propagation_worker.py's docstring
+    # for why this one must stay single-instance rather than joining the
+    # WORKER_COUNT pool.
+    delay_propagation_worker = build_delay_propagation_worker(
+        graph_engine=graph_engine,
+        predictor=predictor,
+        prediction_producer=prediction_producer,
+    )
+    delay_propagation_pool = WorkerPool([delay_propagation_worker])
+    delay_propagation_supervisor = Supervisor(delay_propagation_pool)
+    await delay_propagation_supervisor.start()
+    delay_propagation_supervisor_task = asyncio.create_task(delay_propagation_supervisor.run_forever())
+    delay_propagation_supervisor_task.add_done_callback(_crash_logger("delay propagation supervisor"))
+    delay_propagation_metrics_log_task = asyncio.create_task(
+        delay_propagation_supervisor.run_periodic_metrics_logging()
+    )
 
 
 @app.on_event("shutdown")
@@ -207,6 +235,13 @@ async def shutdown():
         metrics_log_task.cancel()
         try:
             await metrics_log_task
+        except asyncio.CancelledError:
+            pass
+
+    if delay_propagation_metrics_log_task is not None:
+        delay_propagation_metrics_log_task.cancel()
+        try:
+            await delay_propagation_metrics_log_task
         except asyncio.CancelledError:
             pass
 
@@ -226,11 +261,25 @@ async def shutdown():
                 f"{settings.worker_shutdown_timeout_seconds}s — proceeding with shutdown anyway"
             )
 
+    if delay_propagation_supervisor is not None:
+        try:
+            await asyncio.wait_for(
+                delay_propagation_supervisor.stop(), timeout=settings.worker_shutdown_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            print(
+                f"WARNING: delay propagation worker did not shut down within "
+                f"{settings.worker_shutdown_timeout_seconds}s — proceeding with shutdown anyway"
+            )
+
     await kafka_producer.stop()
     if db_pool is not None:
         await db_pool.close()
     await redis_client.aclose()
-    print("Shutdown complete: worker pool + ingestion worker stopped, producer/DB pool/Redis client closed.")
+    print(
+        "Shutdown complete: worker pool + delay propagation worker + ingestion worker stopped, "
+        "producer/DB pool/Redis client closed."
+    )
 
 
 @app.websocket("/ws/{airport_code}")
@@ -270,9 +319,12 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
             await websocket.receive_text()
 
     async def stream_events():
+        # delay-predictions now carries PredictionEvent (Phase F), not
+        # FlightEventEnvelope — .flight_event is the field that keeps this
+        # unpacking, and therefore the frontend's payload shape, unchanged.
         async for message in kafka_consumer:
-            envelope = FlightEventEnvelope.from_json(message.value)
-            await websocket.send_text(envelope.flight_event.model_dump_json())
+            prediction = PredictionEvent.from_json(message.value)
+            await websocket.send_text(prediction.flight_event.model_dump_json())
 
     receiver_task = asyncio.create_task(watch_for_disconnect())
     streamer_task = asyncio.create_task(stream_events())
