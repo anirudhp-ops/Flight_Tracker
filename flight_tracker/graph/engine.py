@@ -209,9 +209,18 @@ class GraphEngine:
                 continue
 
             new_gate = free_gates[0]
+            # Captured before mutating: dst_attrs is a live view into the
+            # same underlying node-attribute dict (not a snapshot), so
+            # reading dst_attrs["gate_id"] *after* the assignment below
+            # would just return new_gate again — old_gate would always
+            # equal new_gate. Found via a real test asserting on old_gate
+            # specifically (Phase G's GateReassignmentDetail was the first
+            # caller to ever actually use this field), not assumed correct
+            # from reading the code.
+            old_gate = dst_attrs["gate_id"]
             used_gates.add(new_gate)
             self.graph.nodes[dst]["gate_id"] = new_gate
-            
+
             if "event" in self.graph.nodes[dst]:
                 self.graph.nodes[dst]["event"].gate_id = new_gate
 
@@ -219,7 +228,7 @@ class GraphEngine:
 
             reassignments.append({
                 "flight_key": dst,
-                "old_gate": dst_attrs["gate_id"],
+                "old_gate": old_gate,
                 "new_gate": new_gate,
                 "event": self.graph.nodes[dst].get("event"),
             })

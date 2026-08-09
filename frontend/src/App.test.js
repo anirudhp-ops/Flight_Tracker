@@ -51,6 +51,13 @@ function mockFlightEvent(overrides = {}) {
   };
 }
 
+// Matches flight_tracker/websocket/messages.py's WSMessage envelope
+// (Phase G): every message the server sends now has this shape, not a
+// bare FlightEvent.
+function wsMessage(type, flightId, data) {
+  return { type, timestamp: new Date().toISOString(), flight_id: flightId, data };
+}
+
 beforeEach(() => {
   MockWebSocket.instances = [];
   global.WebSocket = MockWebSocket;
@@ -78,10 +85,19 @@ test('fetches backend config and opens a websocket to the reported airport', asy
   expect(MockWebSocket.instances[0].url).toBe('ws://localhost:8000/ws/KJFK');
 });
 
-test('shows a waiting message before any flights arrive', async () => {
+test('shows a loading skeleton before the snapshot arrives, then a waiting message once it does', async () => {
   render(<App />);
   await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
-  expect(screen.getByText('Waiting for flights from the backend…')).toBeInTheDocument();
+
+  expect(screen.getByText('Loading flight snapshot…')).toBeInTheDocument();
+
+  const socket = MockWebSocket.instances[0];
+  act(() => {
+    socket.onopen({});
+    socket.onmessage({ data: JSON.stringify(wsMessage('SNAPSHOT', null, { flights: [] })) });
+  });
+
+  await waitFor(() => expect(screen.getByText('Waiting for flights from the backend…')).toBeInTheDocument());
 });
 
 test('renders a flight received over the websocket and updates the delay count', async () => {
@@ -91,16 +107,23 @@ test('renders a flight received over the websocket and updates the delay count',
 
   act(() => {
     socket.onopen({});
-    socket.onmessage({ data: JSON.stringify(mockFlightEvent({ delay_minutes: 0 })) });
+    socket.onmessage({
+      data: JSON.stringify(wsMessage('SNAPSHOT', null, { flights: [mockFlightEvent({ delay_minutes: 0 })] })),
+    });
   });
 
   await waitFor(() => expect(screen.getByText('● Live')).toBeInTheDocument());
-  expect(screen.getByText('1 flights')).toBeInTheDocument();
+  // useFlightData batches incoming messages (processes up to 10 every
+  // 100ms — task 11's performance work), so the snapshot's flight isn't
+  // necessarily in state yet just because the socket is open.
+  await waitFor(() => expect(screen.getByText('1 flights')).toBeInTheDocument());
   expect(screen.getByText('0 delayed')).toBeInTheDocument();
 
   act(() => {
     socket.onmessage({
-      data: JSON.stringify(mockFlightEvent({ flight_id: 'DL200-test', delay_minutes: 45 })),
+      data: JSON.stringify(
+        wsMessage('DELAY_PREDICTION', 'DL200-test', mockFlightEvent({ flight_id: 'DL200-test', delay_minutes: 45 }))
+      ),
     });
   });
 
@@ -108,7 +131,7 @@ test('renders a flight received over the websocket and updates the delay count',
   expect(screen.getByText('1 delayed')).toBeInTheDocument();
 });
 
-test('shows a reconnecting badge when the websocket drops', async () => {
+test('shows a disconnected badge immediately on drop, then reconnecting once a retry begins', async () => {
   render(<App />);
   await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
   const socket = MockWebSocket.instances[0];
@@ -121,5 +144,13 @@ test('shows a reconnecting badge when the websocket drops', async () => {
   act(() => {
     socket.onclose({});
   });
-  await waitFor(() => expect(screen.getByText('● Reconnecting…')).toBeInTheDocument());
-});
+  // Immediately after a drop the hook reports DISCONNECTED — RECONNECTING
+  // only appears once an actual retry attempt begins (useFlightData.js's
+  // RECONNECT_DELAY_MS later), matching the CONNECTING -> CONNECTED ->
+  // DISCONNECTED -> RECONNECTING lifecycle from the Phase G brief.
+  await waitFor(() => expect(screen.getByText('● Disconnected')).toBeInTheDocument());
+
+  // Real timers (not faked): RECONNECT_DELAY_MS is 3s, so this waits for
+  // an actual retry attempt rather than simulating one.
+  await waitFor(() => expect(screen.getByText('● Reconnecting…')).toBeInTheDocument(), { timeout: 5000 });
+}, 10000);

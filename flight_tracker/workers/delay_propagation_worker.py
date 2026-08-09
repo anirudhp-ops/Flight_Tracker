@@ -40,7 +40,7 @@ from flight_tracker.events.event_model import FlightEventEnvelope
 from flight_tracker.events.kafka_producer import KafkaEventProducer
 from flight_tracker.graph.engine import GraphEngine
 from flight_tracker.models.events import FlightEvent
-from flight_tracker.models.prediction_event import PredictionEvent
+from flight_tracker.models.prediction_event import GateReassignmentDetail, PredictionEvent
 from flight_tracker.workers.failure_handler import FailureHandler
 from ml.predictor import DelayPredictor
 
@@ -131,7 +131,6 @@ class DelayPropagationProcessor:
             # collide on a gate purely from a schedule overlap with no
             # delay involved, so this must run for every event.
             reassignments = self._graph_engine.resolve_gate_conflicts()
-            reassigned_events = [r["event"] for r in reassignments if r.get("event")]
 
             propagated: list[tuple[FlightEvent, int]] = []
             # Trivial case for a non-delayed triggering flight: no model
@@ -175,19 +174,42 @@ class DelayPropagationProcessor:
                     propagated_event,
                     predicted_delay_minutes=int(round(predicted)),
                     model_confidence=confidence,
-                    propagation_source=event.flight_key,
+                    # event.flight_id, not event.flight_key: flight_key is
+                    # only meaningful inside GraphEngine's own graph (its
+                    # nodes are keyed by it, which is why propagate_delay()
+                    # itself is called with event.flight_key above) — every
+                    # externally-visible identifier (this PredictionEvent's
+                    # own top-level flight_id, every other message's
+                    # flight_id) is the ingestion-assigned flight_id, so
+                    # propagation_source has to match that or a consumer
+                    # (Phase G's frontend, keying its flights map by
+                    # flight_id) could never actually resolve "the source
+                    # flight" this propagated from. Found via building that
+                    # consumer, not assumed correct beforehand.
+                    propagation_source=event.flight_id,
                     propagation_hops=hops,
                 )
 
-            for reassigned_event in reassigned_events:
+            for reassignment in reassignments:
+                reassigned_event = reassignment.get("event")
+                if reassigned_event is None:
+                    continue
                 # A gate reassignment isn't a model output — delay_minutes
                 # is whatever it already was, confidence=1.0 for the same
                 # "certain, not model-confident" reason as the trivial
-                # source case above.
+                # source case above. old_gate/new_gate come straight from
+                # resolve_gate_conflicts()'s own reassignment dict (Phase F)
+                # — reassigned_event.gate_id is already the *new* gate by
+                # this point, so old_gate has to come from the dict, not
+                # the event.
                 await self._publish(
                     reassigned_event,
                     predicted_delay_minutes=reassigned_event.delay_minutes,
                     model_confidence=1.0,
+                    gate_reassignment=GateReassignmentDetail(
+                        old_gate=reassignment.get("old_gate"),
+                        new_gate=reassignment["new_gate"],
+                    ),
                 )
 
             self.events_processed += 1
@@ -205,6 +227,7 @@ class DelayPropagationProcessor:
         model_confidence: float,
         propagation_source: Optional[str] = None,
         propagation_hops: Optional[int] = None,
+        gate_reassignment: Optional[GateReassignmentDetail] = None,
     ) -> None:
         prediction = PredictionEvent(
             flight_id=event.flight_id,
@@ -212,6 +235,7 @@ class DelayPropagationProcessor:
             predicted_delay_minutes=predicted_delay_minutes,
             predicted_arrival_time=event.estimated_arrival or event.scheduled_arrival,
             model_confidence=model_confidence,
+            gate_reassignment=gate_reassignment,
             propagation_source=propagation_source,
             propagation_hops=propagation_hops,
         )

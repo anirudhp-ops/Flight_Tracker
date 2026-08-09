@@ -1,13 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
 import * as topojson from "topojson-client";
-
-// Same-origin (CRA dev server) can't reach the FastAPI backend directly —
-// it runs on a different port. Override with REACT_APP_BACKEND_URL if the
-// backend isn't at the default uvicorn address.
-const BACKEND_HTTP_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:8000";
-const BACKEND_WS_URL = BACKEND_HTTP_URL.replace(/^http/, "ws");
-const RECONNECT_DELAY_MS = 3000;
+import { useFlightData, ConnectionStatus } from "../hooks/useFlightData";
+import { getIATACode } from "../utils/airportCodes";
+import { delaySeverity } from "../utils/delaySeverity";
+import FlightDetail from "./FlightDetail";
 
 const airports = {
   // ── US West Coast ──
@@ -70,23 +67,9 @@ const airports = {
   CAI:{lat:30.12,lon:31.41},NBO:{lat:-1.32,lon:36.93},JNB:{lat:-26.14,lon:28.25},
 };
 
-function getIATACode(icaoOrIata) {
-  if (!icaoOrIata) return "";
-  const code = icaoOrIata.toUpperCase();
-  if (code.length === 3) return code;
-  if (code.length === 4) {
-    if (code === "EGLL") return "LHR";
-    if (code === "RJAA") return "NRT";
-    if (code === "TJSJ") return "SJU";
-    if (code.startsWith("K")) return code.slice(1);
-  }
-  return code;
-}
-
 function planeColor(f, selected) {
   if (selected) return "#79c0ff";
-  if (f.delay_minutes > 0) return "#ff7b72";
-  return "#56d364";
+  return delaySeverity(f.delay_minutes).color;
 }
 
 function bezierPoint(p1, ctrl, p2, t) {
@@ -127,21 +110,46 @@ function flightPosition(f) {
 }
 
 const STATUS_BADGE = {
-  connecting: { label: "● Connecting…", bg: "#2d2410", fg: "#e3b341" },
-  open: { label: "● Live", bg: "#1a2a1a", fg: "#56d364" },
-  closed: { label: "● Reconnecting…", bg: "#2d2410", fg: "#e3b341" },
-  error: { label: "● Connection error", bg: "#3d1515", fg: "#ff7b72" },
+  [ConnectionStatus.CONNECTING]: { label: "● Connecting…", bg: "#2d2410", fg: "#e3b341" },
+  [ConnectionStatus.CONNECTED]: { label: "● Live", bg: "#1a2a1a", fg: "#56d364" },
+  [ConnectionStatus.RECONNECTING]: { label: "● Reconnecting…", bg: "#2d2410", fg: "#e3b341" },
+  [ConnectionStatus.DISCONNECTED]: { label: "● Disconnected", bg: "#3d1515", fg: "#ff7b72" },
 };
+
+// Cascade overlay coloring: hop 1 skews orange, later hops skew yellow —
+// same idea as the mockup in the Phase G brief ("source red, affected
+// orange -> yellow, fading"), computed rather than hardcoded per hop count
+// so it degrades gracefully past a handful of hops instead of running out
+// of colors.
+function cascadeHopColor(hops) {
+  const t = Math.min(1, (hops - 1) / 3);
+  const from = [255, 140, 66]; // #ff8c42
+  const to = [255, 210, 63]; // #ffd23f
+  const rgb = from.map((c, i) => Math.round(c + (to[i] - c) * t));
+  return `rgb(${rgb.join(",")})`;
+}
 
 export default function FlightMap() {
   const svgRef = useRef(null);
-  const [selected, setSelected] = useState(null);
+  const containerRef = useRef(null);
   const [worldData, setWorldData] = useState(null);
-  const [targetAirport, setTargetAirport] = useState(null);
-  const [connectionStatus, setConnectionStatus] = useState("connecting");
-  const [flightsById, setFlightsById] = useState({});
+  const [width, setWidth] = useState(900);
+  const [hoveredCascadeId, setHoveredCascadeId] = useState(null);
 
-  const flights = useMemo(() => Object.values(flightsById), [flightsById]);
+  const {
+    targetAirport,
+    connectionStatus,
+    hardFailure,
+    snapshotLoaded,
+    flights: flightsById,
+    predictions,
+    gateReassignments,
+    selectedFlightId,
+    setSelectedFlightId,
+    getPropagationChain,
+  } = useFlightData();
+
+  const flights = useMemo(() => Array.from(flightsById.values()), [flightsById]);
 
   // load world map once
   useEffect(() => {
@@ -156,72 +164,77 @@ export default function FlightMap() {
       });
   }, []);
 
-  // fetch which airport the backend is tracking
+  // Responsive width (task 12): the SVG's own viewBox already scales its
+  // *contents*, but the side panel's layout (row vs. stacked) needs a real
+  // breakpoint, so track container width via ResizeObserver.
   useEffect(() => {
-    fetch(`${BACKEND_HTTP_URL}/api/config`)
-      .then(r => r.json())
-      .then(cfg => setTargetAirport(cfg.target_airport))
-      .catch(err => {
-        console.error("Failed to load backend config:", err);
-        setConnectionStatus("error");
-      });
+    if (!containerRef.current) return undefined;
+    const el = containerRef.current;
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) setWidth(entry.contentRect.width);
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
   }, []);
 
-  // connect to the backend's live flight stream, with reconnect on drop
+  const isNarrow = width < 720;
+
+  const selectedFlight = flightsById.get(selectedFlightId) || null;
+  const { upstream, downstream } = useMemo(
+    () => (selectedFlightId ? getPropagationChain(selectedFlightId) : { upstream: null, downstream: [] }),
+    [selectedFlightId, getPropagationChain]
+  );
+
+  // Keyboard navigation (task 13): arrow keys step through the currently
+  // rendered flight list and select one, without requiring a mouse.
+  function handleMapKeyDown(e) {
+    if (!["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(e.key)) return;
+    e.preventDefault();
+    if (flights.length === 0) return;
+    const ids = flights.map((f) => f.flight_id);
+    const currentIdx = ids.indexOf(selectedFlightId);
+    const delta = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : -1;
+    const nextIdx = currentIdx === -1 ? 0 : (currentIdx + delta + ids.length) % ids.length;
+    setSelectedFlightId(ids[nextIdx]);
+  }
+
+  // Everything the render loop below needs, mirrored into refs. This is
+  // the fix for a real performance bug found via live testing against
+  // ~1700 real flights: WS messages arrive batched every 100ms
+  // (useFlightData's own batching), and `flightsById` gets a new Map
+  // reference on every batch — with the D3 effect depending on it
+  // directly, the *entire* redraw (position/rotation trig + attribute
+  // writes for every plane, plus a full cascade-overlay rebuild
+  // restarting all its transitions) was re-running up to 10x/second. At
+  // ~1700 flights that was enough sustained main-thread work to starve
+  // requestAnimationFrame entirely (confirmed: a trivial rAF-loop
+  // measurement timed out against the live page). Refs let the render
+  // loop read the latest data without the *effect itself* re-running on
+  // every data tick — it now runs on its own fixed, bounded cadence
+  // instead (see the interval below), which is what actually decouples
+  // "how often data arrives" from "how often we redraw."
+  const flightsByIdRef = useRef(flightsById);
+  const selectedFlightIdRef = useRef(selectedFlightId);
+  const gateReassignmentsRef = useRef(gateReassignments);
+  const hoveredCascadeIdRef = useRef(hoveredCascadeId);
+  const cascadeRef = useRef({ selectedFlight: null, upstream: null, downstream: [] });
+  useEffect(() => { flightsByIdRef.current = flightsById; }, [flightsById]);
+  useEffect(() => { selectedFlightIdRef.current = selectedFlightId; }, [selectedFlightId]);
+  useEffect(() => { gateReassignmentsRef.current = gateReassignments; }, [gateReassignments]);
+  useEffect(() => { hoveredCascadeIdRef.current = hoveredCascadeId; }, [hoveredCascadeId]);
   useEffect(() => {
-    if (!targetAirport) return;
+    cascadeRef.current = { selectedFlight, upstream, downstream };
+  }, [selectedFlight, upstream, downstream]);
 
-    let socket;
-    let reconnectTimer;
-    let stopped = false;
-
-    function connect() {
-      setConnectionStatus("connecting");
-      socket = new WebSocket(`${BACKEND_WS_URL}/ws/${targetAirport}`);
-
-      socket.onopen = () => {
-        if (stopped) return;
-        setConnectionStatus("open");
-      };
-
-      socket.onmessage = (evt) => {
-        if (stopped) return;
-        try {
-          const flight = JSON.parse(evt.data);
-          setFlightsById(prev => ({ ...prev, [flight.flight_id]: flight }));
-        } catch (err) {
-          console.error("Failed to parse flight event:", err);
-        }
-      };
-
-      socket.onclose = () => {
-        if (stopped) return;
-        setConnectionStatus("closed");
-        reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
-      };
-
-      socket.onerror = () => {
-        if (stopped) return;
-        setConnectionStatus("error");
-        socket.close();
-      };
-    }
-
-    connect();
-
-    return () => {
-      stopped = true;
-      clearTimeout(reconnectTimer);
-      if (socket) socket.close();
-    };
-  }, [targetAirport]);
-
-  // d3 render
+  // d3 render — set up once per worldData load, then redraws on a fixed
+  // 500ms interval (comfortably smooth for markers that move across the
+  // whole map over tens of minutes, and bounds worst-case work to 2 full
+  // passes/sec instead of one per WS batch) rather than on every React
+  // re-render.
   useEffect(() => {
-    if (!worldData) return;
+    if (!worldData) return undefined;
     const W = 900, H = 500;
     const svg = d3.select(svgRef.current);
-    svg.selectAll("*").remove();
     svg.attr("viewBox", `0 0 ${W} ${H}`);
 
     const proj = d3.geoNaturalEarth1().scale(140).translate([W/2, H/2]);
@@ -232,147 +245,317 @@ export default function FlightMap() {
       return a ? proj([a.lon, a.lat]) : null;
     }
 
+    svg.selectAll("*").remove();
     svg.append("rect").attr("width", W).attr("height", H).attr("fill", "#0a0f1a");
-
-    svg.append("g").selectAll("path")
+    svg.append("g").attr("class", "countries").selectAll("path")
       .data(topojson.feature(worldData, worldData.objects.countries).features)
       .join("path").attr("d", path)
       .attr("fill", "#161d2e").attr("stroke", "#1e2940").attr("stroke-width", 0.4);
+    const routeG = svg.append("g").attr("class", "routes");
+    const apG = svg.append("g").attr("class", "airports-layer");
+    const cascadeG = svg.append("g").attr("class", "cascade");
+    const planeG = svg.append("g").attr("class", "planes");
 
-    const routeG = svg.append("g");
-    const apG = svg.append("g");
-    const planeG = svg.append("g");
+    let lastCascadeKey = null;
 
-    const displayFlights = flights;
+    function renderFrame() {
+      const flightsByIdNow = flightsByIdRef.current;
+      const displayFlights = Array.from(flightsByIdNow.values());
+      const selectedFlightIdNow = selectedFlightIdRef.current;
+      const gateReassignmentsNow = gateReassignmentsRef.current;
+      const hoveredCascadeIdNow = hoveredCascadeIdRef.current;
 
-    displayFlights.forEach(f => {
-      const p1 = project(f.origin), p2 = project(f.destination);
-      if (!p1 || !p2) return;
-      const ctrl = ctrlPoint(p1, p2);
-      const isDelayed = f.delay_minutes > 0;
-      routeG.append("path")
-        .attr("d", `M${p1[0]},${p1[1]} Q${ctrl[0]},${ctrl[1]} ${p2[0]},${p2[1]}`)
+      // Routes: keyed join by flight_id so unrelated flights don't get
+      // torn down and rebuilt just because some other flight changed.
+      routeG.selectAll("path")
+        .data(
+          displayFlights.filter((f) => project(f.origin) && project(f.destination)),
+          (f) => f.flight_id
+        )
+        .join("path")
+        .attr("d", (f) => {
+          const p1 = project(f.origin), p2 = project(f.destination);
+          const ctrl = ctrlPoint(p1, p2);
+          return `M${p1[0]},${p1[1]} Q${ctrl[0]},${ctrl[1]} ${p2[0]},${p2[1]}`;
+        })
         .attr("fill", "none")
-        .attr("stroke", isDelayed ? "#ff7b72" : "#388bfd")
-        .attr("stroke-width", isDelayed ? 1.8 : 1.0)
-        .attr("stroke-opacity", isDelayed ? 0.70 : 0.45)
-        .attr("stroke-dasharray", isDelayed ? "none" : "4,3");
-    });
+        .attr("stroke", (f) => (f.delay_minutes > 0 ? "#ff7b72" : "#388bfd"))
+        .attr("stroke-width", (f) => (f.delay_minutes > 0 ? 1.8 : 1.0))
+        .attr("stroke-opacity", (f) => (f.delay_minutes > 0 ? 0.70 : 0.45))
+        .attr("stroke-dasharray", (f) => (f.delay_minutes > 0 ? "none" : "4,3"));
 
-    const apSet = new Set(displayFlights.flatMap(f => [f.origin, f.destination]).filter(Boolean));
-    apSet.forEach(code => {
-      const pt = project(code);
-      if (!pt) return;
-      const [x, y] = pt;
-      const s = 4;
-      apG.append("line").attr("x1",x).attr("y1",y-s).attr("x2",x).attr("y2",y+s)
-        .attr("stroke","#388bfd").attr("stroke-width",1).attr("stroke-opacity",0.7);
-      apG.append("line").attr("x1",x-s).attr("y1",y).attr("x2",x+s).attr("y2",y)
-        .attr("stroke","#388bfd").attr("stroke-width",1).attr("stroke-opacity",0.7);
-      apG.append("text").attr("x",x+7).attr("y",y+3.5)
-        .attr("font-size",8).attr("fill","#8b949e").text(getIATACode(code));
-    });
+      const apSet = new Set(displayFlights.flatMap((f) => [f.origin, f.destination]).filter(Boolean));
+      apG.selectAll("g").data(Array.from(apSet), (d) => d).join((enter) => {
+        const g = enter.append("g");
+        g.each(function (code) {
+          const pt = project(code);
+          if (!pt) return;
+          const [x, y] = pt;
+          const s = 4;
+          const sel = d3.select(this);
+          sel.append("line").attr("x1",x).attr("y1",y-s).attr("x2",x).attr("y2",y+s)
+            .attr("stroke","#388bfd").attr("stroke-width",1).attr("stroke-opacity",0.7);
+          sel.append("line").attr("x1",x-s).attr("y1",y).attr("x2",x+s).attr("y2",y)
+            .attr("stroke","#388bfd").attr("stroke-width",1).attr("stroke-opacity",0.7);
+          sel.append("text").attr("x",x+7).attr("y",y+3.5)
+            .attr("font-size",8).attr("fill","#8b949e").text(getIATACode(code));
+        });
+        return g;
+      });
 
-    displayFlights.forEach(f => {
-      const p1 = project(f.origin), p2 = project(f.destination);
-      if (!p1 || !p2) return;
-      const ctrl = ctrlPoint(p1, p2);
-      const t = flightPosition(f);
-      const pos = bezierPoint(p1, ctrl, p2, t);
-      const tan = bezierTangent(p1, ctrl, p2, t);
-      const angle = Math.atan2(tan[1], tan[0]) * 180 / Math.PI + 90;
-      const isSel = selected === f.flight_id;
-      const col = planeColor(f, isSel);
-
-      const g = planeG.append("g")
-        .attr("transform", `translate(${pos[0]},${pos[1]})`)
+      // Planes: keyed join by flight_id.
+      const planes = planeG.selectAll("g.plane")
+        .data(
+          displayFlights.filter((f) => project(f.origin) && project(f.destination)),
+          (f) => f.flight_id
+        )
+        .join((enter) => {
+          const g = enter.append("g").attr("class", "plane");
+          g.append("circle").attr("class", "select-ring").attr("r", 13).attr("fill", "none")
+            .attr("stroke", "#79c0ff").attr("stroke-width", 1).attr("stroke-opacity", 0);
+          const rotated = g.append("g").attr("class", "rotated");
+          rotated.append("path").attr("class", "body").attr("d", "M0,-9 L5,5 L0,2.5 L-5,5 Z")
+            .attr("stroke", "#0d1117").attr("stroke-width", 0.8);
+          g.append("circle").attr("class", "delay-badge").attr("cx",8).attr("cy",-8).attr("r",5)
+            .attr("fill","#ff7b72").attr("stroke","#0d1117").attr("stroke-width",0.5).attr("opacity", 0);
+          g.append("text").attr("class", "delay-badge-text").attr("x",8).attr("y",-5)
+            .attr("text-anchor","middle").attr("font-size",6).attr("font-weight",700)
+            .attr("fill","#0d1117").text("!").attr("opacity", 0);
+          g.append("rect").attr("class", "gate-badge").attr("x", -13).attr("y", -13)
+            .attr("width", 6).attr("height", 6).attr("fill", "#e3b341")
+            .attr("stroke", "#0d1117").attr("stroke-width", 0.4).attr("opacity", 0);
+          return g;
+        })
         .attr("cursor", "pointer")
-        .on("click", () => setSelected(prev => prev === f.flight_id ? null : f.flight_id));
+        .attr("tabindex", 0)
+        .attr("role", "button")
+        .attr("aria-label", (f) => `Flight ${f.airline_code}${f.flight_number}, ${getIATACode(f.origin)} to ${getIATACode(f.destination)}, ${f.delay_minutes > 0 ? `delayed ${f.delay_minutes} minutes` : "on time"}`)
+        .on("click", (event, f) => setSelectedFlightId((prev) => (prev === f.flight_id ? null : f.flight_id)))
+        .on("keydown", (event, f) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setSelectedFlightId((prev) => (prev === f.flight_id ? null : f.flight_id));
+          }
+        });
 
-      if (isSel) {
-        g.append("circle").attr("r", 13).attr("fill", "none")
-          .attr("stroke", "#79c0ff").attr("stroke-width", 1).attr("stroke-opacity", 0.5);
+      planes.each(function (f) {
+        const g = d3.select(this);
+        const p1 = project(f.origin), p2 = project(f.destination);
+        const ctrl = ctrlPoint(p1, p2);
+        const t = flightPosition(f);
+        const pos = bezierPoint(p1, ctrl, p2, t);
+        const tan = bezierTangent(p1, ctrl, p2, t);
+        const angle = Math.atan2(tan[1], tan[0]) * 180 / Math.PI + 90;
+        const isSel = selectedFlightIdNow === f.flight_id;
+        const col = planeColor(f, isSel);
+
+        g.attr("transform", `translate(${pos[0]},${pos[1]})`);
+        g.select(".select-ring").attr("stroke-opacity", isSel ? 0.5 : 0);
+        g.select(".rotated").attr("transform", `rotate(${angle})`);
+        g.select(".body").attr("fill", col);
+        const delayed = f.delay_minutes > 0;
+        g.select(".delay-badge").attr("opacity", delayed ? 1 : 0);
+        g.select(".delay-badge-text").attr("opacity", delayed ? 1 : 0);
+        g.select(".gate-badge").attr("opacity", gateReassignmentsNow.get(f.flight_id) ? 1 : 0);
+      });
+
+      // Propagation cascade overlay (task 5): small dataset, but only
+      // rebuilt (and its entrance transitions restarted) when the actual
+      // selection/chain identity changes — not every render tick — so
+      // the source pulse's own indefinite <animate> loop isn't chopped
+      // off mid-cycle every 500ms.
+      const { selectedFlight: selFlight, upstream: up, downstream: down } = cascadeRef.current;
+      const cascadeKey = selFlight
+        ? `${selFlight.flight_id}|${down.map((d) => `${d.flight_id}:${d.hops}`).join(",")}|${up?.flight_id || ""}|${hoveredCascadeIdNow || ""}`
+        : null;
+
+      if (cascadeKey !== lastCascadeKey) {
+        lastCascadeKey = cascadeKey;
+        cascadeG.selectAll("*").remove();
+
+        if (selFlight) {
+          const sourcePos = project(selFlight.origin) && project(selFlight.destination)
+            ? bezierPoint(
+                project(selFlight.origin),
+                ctrlPoint(project(selFlight.origin), project(selFlight.destination)),
+                project(selFlight.destination),
+                flightPosition(selFlight)
+              )
+            : null;
+
+          if (sourcePos && down.length > 0) {
+            const pulse = cascadeG.append("circle")
+              .attr("cx", sourcePos[0]).attr("cy", sourcePos[1]).attr("r", 9)
+              .attr("fill", "none").attr("stroke", "#f85149").attr("stroke-width", 1.5);
+            pulse.append("animate").attr("attributeName", "r").attr("values", "9;20;9").attr("dur", "1.6s").attr("repeatCount", "indefinite");
+            pulse.append("animate").attr("attributeName", "stroke-opacity").attr("values", "0.9;0;0.9").attr("dur", "1.6s").attr("repeatCount", "indefinite");
+
+            down.forEach((d, i) => {
+              const target = flightsByIdNow.get(d.flight_id);
+              if (!target) return;
+              const p1 = project(target.origin), p2 = project(target.destination);
+              if (!p1 || !p2) return;
+              const targetPos = bezierPoint(p1, ctrlPoint(p1, p2), p2, flightPosition(target));
+              const color = cascadeHopColor(d.hops || 1);
+              const isHovered = hoveredCascadeIdNow === d.flight_id;
+
+              const link = cascadeG.append("line")
+                .attr("x1", sourcePos[0]).attr("y1", sourcePos[1])
+                .attr("x2", targetPos[0]).attr("y2", targetPos[1])
+                .attr("stroke", color)
+                .attr("stroke-width", isHovered ? 2.2 : 1.2)
+                .attr("stroke-opacity", 0)
+                .attr("stroke-dasharray", "3,2");
+              link.transition().delay(i * 150).duration(400).attr("stroke-opacity", isHovered ? 0.95 : 0.6);
+
+              const decay = Math.round(0.75 ** (d.hops || 1) * 100);
+              const mid = [(sourcePos[0] + targetPos[0]) / 2, (sourcePos[1] + targetPos[1]) / 2];
+              cascadeG.append("text")
+                .attr("x", mid[0]).attr("y", mid[1] - 3)
+                .attr("font-size", 7).attr("fill", color).attr("text-anchor", "middle")
+                .attr("opacity", 0)
+                .text(`+${d.delay_minutes}m · ${decay}%`)
+                .transition().delay(i * 150).duration(400).attr("opacity", 0.9);
+
+              const ring = cascadeG.append("circle")
+                .attr("cx", targetPos[0]).attr("cy", targetPos[1])
+                .attr("r", isHovered ? 12 : 9)
+                .attr("fill", "none").attr("stroke", color).attr("stroke-width", isHovered ? 2 : 1.3)
+                .attr("opacity", 0)
+                .style("cursor", "pointer")
+                .on("mouseenter", () => setHoveredCascadeId(d.flight_id))
+                .on("mouseleave", () => setHoveredCascadeId((prev) => (prev === d.flight_id ? null : prev)))
+                .on("click", () => setSelectedFlightId(d.flight_id));
+              ring.transition().delay(i * 150).duration(400).attr("opacity", 1);
+
+              if (gateReassignmentsNow.get(d.flight_id)) {
+                cascadeG.append("rect")
+                  .attr("x", targetPos[0] + 6).attr("y", targetPos[1] - 6)
+                  .attr("width", 7).attr("height", 7)
+                  .attr("fill", "#e3b341").attr("stroke", "#0d1117").attr("stroke-width", 0.5)
+                  .attr("opacity", 0)
+                  .transition().delay(i * 150).duration(400).attr("opacity", 1);
+              }
+            });
+          }
+
+          if (sourcePos && up) {
+            const src = flightsByIdNow.get(up.flight_id);
+            if (src) {
+              const p1 = project(src.origin), p2 = project(src.destination);
+              if (p1 && p2) {
+                const upstreamPos = bezierPoint(p1, ctrlPoint(p1, p2), p2, flightPosition(src));
+                cascadeG.append("line")
+                  .attr("x1", upstreamPos[0]).attr("y1", upstreamPos[1])
+                  .attr("x2", sourcePos[0]).attr("y2", sourcePos[1])
+                  .attr("stroke", "#e3b341").attr("stroke-width", 1).attr("stroke-opacity", 0.5)
+                  .attr("stroke-dasharray", "2,3");
+              }
+            }
+          }
+        }
       }
+    }
 
-      g.append("g").attr("transform", `rotate(${angle})`)
-        .append("path").attr("d", "M0,-9 L5,5 L0,2.5 L-5,5 Z")
-        .attr("fill", col).attr("stroke", "#0d1117").attr("stroke-width", 0.8);
+    renderFrame();
+    const interval = setInterval(renderFrame, 500);
+    return () => clearInterval(interval);
+  }, [worldData, setSelectedFlightId]);
 
-      if (f.delay_minutes > 0) {
-        g.append("circle").attr("cx",8).attr("cy",-8).attr("r",5)
-          .attr("fill","#ff7b72").attr("stroke","#0d1117").attr("stroke-width",0.5);
-        g.append("text").attr("x",8).attr("y",-5)
-          .attr("text-anchor","middle").attr("font-size",6).attr("font-weight",700)
-          .attr("fill","#0d1117").text("!");
-      }
-    });
-
-  }, [worldData, flights, selected]);
-
-  const selectedFlight = flights.find(f => f.flight_id === selected);
   const delayed = flights.filter(f => f.delay_minutes > 0).length;
   const total = flights.length;
   const airportLabel = targetAirport ? getIATACode(targetAirport) : "…";
-  const badge = STATUS_BADGE[connectionStatus] || STATUS_BADGE.connecting;
+  const badge = STATUS_BADGE[connectionStatus] || STATUS_BADGE[ConnectionStatus.CONNECTING];
+
+  const selectedPrediction = selectedFlightId ? predictions.get(selectedFlightId) : null;
+  const selectedGateReassignment = selectedFlightId ? gateReassignments.get(selectedFlightId) : null;
 
   return (
-    <div style={{background:"#0d1117",borderRadius:12,overflow:"hidden",border:"0.5px solid #30363d",fontFamily:"sans-serif",color:"#e6edf3"}}>
-      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",background:"#161b22",borderBottom:"0.5px solid #30363d"}}>
-        <div style={{display:"flex",alignItems:"center",gap:10}}>
+    <div
+      ref={containerRef}
+      style={{background:"#0d1117",borderRadius:12,overflow:"hidden",border:"0.5px solid #30363d",fontFamily:"sans-serif",color:"#e6edf3"}}
+    >
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 16px",background:"#161b22",borderBottom:"0.5px solid #30363d",flexWrap:"wrap",gap:6}}>
+        <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
           <span style={{fontSize:13,fontWeight:500}}>FlightTracker — {airportLabel}</span>
           <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#0d1f3c",color:"#79c0ff"}}>{total} flights</span>
           <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:"#3d1515",color:"#ff7b72"}}>{delayed} delayed</span>
-          <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:badge.bg,color:badge.fg}}>{badge.label}</span>
+          <span style={{fontSize:11,padding:"2px 8px",borderRadius:20,background:badge.bg,color:badge.fg}} role="status" aria-live="polite">{badge.label}</span>
         </div>
-        <span style={{fontSize:11,color:"#8b949e"}}>Click a plane to inspect</span>
+        <span style={{fontSize:11,color:"#8b949e"}}>Click a plane, or use arrow keys, to inspect</span>
       </div>
 
-      <div style={{position:"relative"}}>
-        <svg ref={svgRef} style={{width:"100%",height:480,display:"block"}} />
-        {total === 0 && (
-          <div style={{position:"absolute",top:12,left:12,fontSize:12,color:"#8b949e",background:"#161b22cc",border:"0.5px solid #30363d",borderRadius:8,padding:"6px 10px"}}>
-            {connectionStatus === "error" ? "Can't reach the backend." : "Waiting for flights from the backend…"}
-          </div>
-        )}
-        <div style={{position:"absolute",top:12,right:12,width:230,background:"#161b22cc",border:"0.5px solid #30363d",borderRadius:8,overflow:"hidden"}}>
+      <div style={{position:"relative", display: isNarrow ? "block" : "flex"}}>
+        <div style={{position:"relative", flex: "1 1 auto", minWidth: 0}}>
+          <svg
+            ref={svgRef}
+            role="img"
+            aria-label={`Map of ${total} tracked flights around ${airportLabel}, ${delayed} delayed. Use arrow keys to cycle through flights.`}
+            tabIndex={0}
+            onKeyDown={handleMapKeyDown}
+            style={{width:"100%",height:480,display:"block",outline:"none"}}
+          />
+          {!snapshotLoaded && (
+            <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",background:"#0a0f1acc"}}>
+              <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:8}}>
+                <div style={{width:24,height:24,border:"2px solid #30363d",borderTopColor:"#58a6ff",borderRadius:"50%",animation:"ft-spin 0.8s linear infinite"}} />
+                <span style={{fontSize:12,color:"#8b949e"}}>Loading flight snapshot…</span>
+              </div>
+            </div>
+          )}
+          {snapshotLoaded && total === 0 && (
+            <div style={{position:"absolute",top:12,left:12,fontSize:12,color:"#8b949e",background:"#161b22cc",border:"0.5px solid #30363d",borderRadius:8,padding:"6px 10px"}}>
+              Waiting for flights from the backend…
+            </div>
+          )}
+          {hardFailure && (
+            <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",background:"#0a0f1aee"}}>
+              <div style={{textAlign:"center",fontSize:12,color:"#ff7b72",background:"#161b22",border:"0.5px solid #3d1515",borderRadius:8,padding:"14px 18px"}}>
+                Connection failed.<br/>
+                <span style={{color:"#8b949e",fontSize:11}}>Refresh to retry.</span>
+              </div>
+            </div>
+          )}
+          {!hardFailure && connectionStatus === ConnectionStatus.RECONNECTING && (
+            <div style={{position:"absolute",bottom:12,left:12,fontSize:11,color:"#e3b341",background:"#161b22cc",border:"0.5px solid #30363d",borderRadius:8,padding:"5px 10px"}}>
+              Reconnecting…
+            </div>
+          )}
+        </div>
+
+        <div style={{
+          width: isNarrow ? "auto" : 260,
+          maxHeight: isNarrow ? 320 : 480,
+          overflowY: "auto",
+          background:"#161b22",
+          borderLeft: isNarrow ? "none" : "0.5px solid #30363d",
+          borderTop: isNarrow ? "0.5px solid #30363d" : "none",
+        }}>
           <div style={{padding:"8px 12px",borderBottom:"0.5px solid #30363d",fontSize:11,color:"#8b949e",textTransform:"uppercase",letterSpacing:".07em"}}>Flight detail</div>
           <div style={{padding:"10px 12px"}}>
-            {!selectedFlight ? (
-              <div style={{fontSize:12,color:"#8b949e"}}>Click a plane to inspect.</div>
-            ) : (
-              <>
-                {[
-                  ["Flight", `${selectedFlight.airline_code}${selectedFlight.flight_number}`],
-                  ["Route", `${getIATACode(selectedFlight.origin)} → ${getIATACode(selectedFlight.destination)}`],
-                  ["Aircraft", selectedFlight.aircraft_id || "N/A"],
-                  ["Gate", selectedFlight.gate_id || "N/A"],
-                  ["Status", selectedFlight.status],
-                ].map(([l,v]) => (
-                  <div key={l} style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"3px 0",borderBottom:"0.5px solid #21262d"}}>
-                    <span style={{color:"#8b949e"}}>{l}</span>
-                    <span style={{fontWeight:500}}>{v}</span>
-                  </div>
-                ))}
-                <div style={{display:"flex",justifyContent:"space-between",fontSize:12,padding:"3px 0"}}>
-                  <span style={{color:"#8b949e"}}>Delay</span>
-                  <span style={{fontWeight:500,color:selectedFlight.delay_minutes>0?"#e3b341":"#56d364"}}>
-                    {selectedFlight.delay_minutes > 0 ? `+${selectedFlight.delay_minutes} min` : "On time"}
-                  </span>
-                </div>
-              </>
-            )}
+            <FlightDetail
+              flight={selectedFlight}
+              prediction={selectedPrediction}
+              upstream={upstream}
+              downstream={downstream}
+              gateReassignment={selectedGateReassignment}
+              flights={flightsById}
+              gateReassignments={gateReassignments}
+              onSelectFlight={setSelectedFlightId}
+            />
           </div>
         </div>
       </div>
 
       <div style={{display:"flex",flexWrap:"wrap",gap:10,padding:"8px 16px",background:"#161b22",borderTop:"0.5px solid #30363d"}}>
-        {[["#56d364","On time"],["#ff7b72","Delayed"],["#79c0ff","Selected"]].map(([col,label]) => (
+        {[["#58a6ff","On time"],["#d29922","Minor delay"],["#e8871e","Moderate delay"],["#f85149","Severe delay"],["#79c0ff","Selected"]].map(([col,label]) => (
           <div key={label} style={{display:"flex",alignItems:"center",gap:5,fontSize:10,color:"#8b949e"}}>
             <svg width="10" height="10" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill={col}/></svg>
             {label}
           </div>
         ))}
       </div>
+      <style>{"@keyframes ft-spin { to { transform: rotate(360deg); } }"}</style>
     </div>
   );
 }

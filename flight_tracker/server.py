@@ -1,4 +1,6 @@
 import asyncio
+import json
+from collections import deque
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,10 +18,19 @@ from flight_tracker.graph.engine import GraphEngine
 from flight_tracker.ingestion.worker import run as worker_run
 from flight_tracker.ingestion.client import MockFlightAwareClient, FlightAwareClient
 from flight_tracker.models.prediction_event import PredictionEvent
+from flight_tracker.websocket.messages import (
+    WSMessageType,
+    classify_prediction_event,
+    heartbeat_message,
+    snapshot_message,
+)
 from flight_tracker.workers.delay_propagation_worker import build_delay_propagation_worker
 from flight_tracker.workers.supervisor import Supervisor
 from flight_tracker.workers.worker_pool import WorkerPool, build_worker_pool
 from ml.predictor import DelayPredictor
+
+WS_HEARTBEAT_INTERVAL_SECONDS = 30
+WS_HISTORY_MAX_MESSAGES = 100
 
 app = FastAPI()
 
@@ -117,6 +128,18 @@ supervisor: Supervisor | None = None
 metrics_log_task = None
 delay_propagation_supervisor: Supervisor | None = None
 delay_propagation_metrics_log_task = None
+
+# Shared across all /ws connections (this app tracks exactly one airport —
+# see settings.target_airport — so one buffer, not one per airport, is
+# correct here; multi-airport support is explicitly out of Phase G's scope).
+# A late-connecting client gets this replayed right after its SNAPSHOT, so
+# it doesn't miss whatever happened in the gap between "server started
+# streaming" and "this client's WebSocket handshake completed" — the
+# "server keeps event history for late-connecting clients" option from the
+# Phase G brief (the alternative it offered, client-requested replay, would
+# need its own request/response sub-protocol for no real benefit over just
+# always replaying a bounded, small history on connect).
+recent_ws_messages: deque = deque(maxlen=WS_HISTORY_MAX_MESSAGES)
 
 
 @app.get("/api/flights/{flight_id}")
@@ -284,21 +307,50 @@ async def shutdown():
 
 @app.websocket("/ws/{airport_code}")
 async def websocket_endpoint(websocket: WebSocket, airport_code: str):
+    """
+    Phase G protocol: every message sent is a WSMessage (see
+    flight_tracker/websocket/messages.py) — type + timestamp + optional
+    flight_id + a data dict, not the bare FlightEvent JSON this endpoint
+    used to send. On connect: one SNAPSHOT, then a replay of
+    `recent_ws_messages` (bounded history for late joiners), then the live
+    stream. A single `outbox` queue is the only thing that ever calls
+    websocket.send_text() — the heartbeat, the Kafka stream, and (indirectly,
+    via history replay) connection setup would otherwise be up to three
+    concurrent writers on the same socket, which FastAPI's WebSocket does
+    not guarantee is safe.
+    """
     await websocket.accept()
 
-    # Send all currently active flights in graph_engine to the client upon connection
-    for node, attrs in graph_engine.graph.nodes(data=True):
-        event_obj = attrs.get("event")
-        if event_obj:
-            await websocket.send_text(event_obj.model_dump_json())
+    outbox: asyncio.Queue = asyncio.Queue()
+    # Mutable holder (not a bare variable) so both the receiver task
+    # (writes, on a client "subscribe"/"unsubscribe" message) and the
+    # stream task (reads, to decide what to forward) can share it via
+    # closure without a `nonlocal` per task.
+    sub_state = {"flight_id": None}
+
+    # SNAPSHOT first: current graph_engine state for this airport, built
+    # fresh per connection rather than cached — matches the old dump-on-
+    # connect behavior, just now typed and batched into one message
+    # instead of one send_text() per flight.
+    snapshot_flights = [
+        attrs["event"].model_dump(mode="json")
+        for _, attrs in graph_engine.graph.nodes(data=True)
+        if attrs.get("event") is not None
+    ]
+    await websocket.send_text(snapshot_message(snapshot_flights).to_json())
+
+    # Bounded history replay for late joiners — see recent_ws_messages'
+    # own comment for why this is a shared buffer, not per-connection.
+    for historical_msg in list(recent_ws_messages):
+        await websocket.send_text(historical_msg.to_json())
 
     # Each connection gets its own throwaway consumer group so every
     # connected browser tab sees the full delay-predictions stream
     # independently — in the same group, multiple consumers *split* the
     # partitions instead of each seeing everything. auto_offset_reset
-    # "latest": the graph dump above already represents current state, so a
-    # newly-connected client doesn't need (and shouldn't get) a replay of
-    # the topic's whole retained history — only what happens from here on.
+    # "latest": the snapshot+history above already cover current/recent
+    # state, so a newly-connected client doesn't need (and shouldn't get) a
+    # replay of the topic's whole retained history too.
     group_id = f"{settings.kafka_consumer_group_websocket}-{uuid4()}"
     kafka_consumer = AIOKafkaConsumer(
         settings.kafka_topic_delay_predictions,
@@ -310,33 +362,77 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
     await kafka_consumer.start()
 
     async def watch_for_disconnect():
-        # stream_events() below only ever writes to the socket — it never
-        # reads from it, so without this, a closed browser tab is invisible
-        # to the server until the next send_text() happens to fail.
-        # receive_text() raises WebSocketDisconnect the moment the client
-        # actually closes.
+        # Also the only reader of client-sent frames, so this is where an
+        # optional {"action":"subscribe","flight_id":...}/{"action":
+        # "unsubscribe"} message (task 1's "optional: subscribe to a
+        # specific flight_id") gets applied. Malformed/unrecognized frames
+        # are ignored, not fatal — a stray or future-versioned client
+        # message shouldn't kill the connection. receive_text() raising
+        # WebSocketDisconnect the moment the client actually closes is
+        # still what detects a dead client — without a reader at all, a
+        # closed tab is invisible to the server until the next
+        # send_text() happens to fail.
         while True:
-            await websocket.receive_text()
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            action = msg.get("action")
+            if action == "subscribe" and msg.get("flight_id"):
+                sub_state["flight_id"] = msg["flight_id"]
+            elif action == "unsubscribe":
+                sub_state["flight_id"] = None
+
+    def _passes_filter(ws_msg) -> bool:
+        flight_id = sub_state["flight_id"]
+        if flight_id is None:
+            return True
+        if ws_msg.flight_id == flight_id:
+            return True
+        # A client watching one flight should still see cascades that
+        # originate from it, not just direct updates to it.
+        return ws_msg.data.get("propagation_source") == flight_id
 
     async def stream_events():
-        # delay-predictions now carries PredictionEvent (Phase F), not
-        # FlightEventEnvelope — .flight_event is the field that keeps this
-        # unpacking, and therefore the frontend's payload shape, unchanged.
+        # delay-predictions carries PredictionEvent (Phase F); each maps to
+        # exactly one typed WSMessage (Phase G) via classify_prediction_event.
         async for message in kafka_consumer:
             prediction = PredictionEvent.from_json(message.value)
-            await websocket.send_text(prediction.flight_event.model_dump_json())
+            ws_msg = classify_prediction_event(prediction)
+            recent_ws_messages.append(ws_msg)
+            if _passes_filter(ws_msg):
+                await outbox.put(ws_msg)
+
+    async def send_heartbeats():
+        # App-level heartbeat, not a raw WS ping/pong frame: the frontend
+        # needs something it can observe through the same onmessage handler
+        # it already has, to detect "socket claims open but nothing — not
+        # even a heartbeat — has arrived in N seconds" without a separate
+        # low-level ping/pong API.
+        while True:
+            await asyncio.sleep(WS_HEARTBEAT_INTERVAL_SECONDS)
+            await outbox.put(heartbeat_message())
+
+    async def drain_outbox():
+        # The single writer — see this function's own docstring above for
+        # why nothing else calls websocket.send_text() directly.
+        while True:
+            ws_msg = await outbox.get()
+            await websocket.send_text(ws_msg.to_json())
 
     receiver_task = asyncio.create_task(watch_for_disconnect())
     streamer_task = asyncio.create_task(stream_events())
+    heartbeat_task = asyncio.create_task(send_heartbeats())
+    sender_task = asyncio.create_task(drain_outbox())
+    tasks = (receiver_task, streamer_task, heartbeat_task, sender_task)
     try:
-        done, _ = await asyncio.wait(
-            {receiver_task, streamer_task}, return_when=asyncio.FIRST_COMPLETED
-        )
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        for task in (receiver_task, streamer_task):
+        for task in tasks:
             if not task.done():
                 task.cancel()
-        results = await asyncio.gather(receiver_task, streamer_task, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         await kafka_consumer.stop()
 
     for result in results:
