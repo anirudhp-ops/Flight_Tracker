@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 
+from flight_tracker.events.event_model import EventSource
 from flight_tracker.models.events import (
     AirportSnapshot,
     EventType,
@@ -112,6 +113,11 @@ class FlightAwareClient:
     Use MockFlightAwareClient below during development.
     """
 
+    # Read by ingestion/worker.py to tag published events' EventSource
+    # without the worker needing to import/isinstance-check concrete client
+    # classes — duck-typed like get_airport_flights() already is.
+    source = EventSource.FLIGHTAWARE
+
     def __init__(self, api_key: str):
         self._headers = {
             "x-apikey": api_key,
@@ -143,6 +149,8 @@ class MockFlightAwareClient:
     the rest of the system without API credentials.
     Swap this out for FlightAwareClient once you have a key.
     """
+
+    source = EventSource.MOCK
 
     AIRLINES = [("UA", "United"), ("AA", "American"), ("DL", "Delta"), ("WN", "Southwest")]
     AIRPORTS = ["KLAX", "KORD", "KJFK", "KATL", "KDFW", "KDEN", "KLAS", "KSEA"]

@@ -15,6 +15,15 @@ pydantic-settings==2.15.0
 networkx==3.6.1
 numpy==2.5.1
 
+# Asyncio-native Kafka client (flight_tracker/events/) — matches the
+# asyncpg/redis.asyncio pattern already used elsewhere rather than wrapping
+# a sync client (confluent-kafka, kafka-python) in an executor.
+aiokafka==0.14.0
+
+# scripts/measure_kafka_performance.py only — a plain WebSocket client to
+# exercise /ws/{airport_code} the same way the frontend does.
+websockets==17.0.1
+
 # Pinned to match the scikit-learn version ml/model.pkl was trained and
 # pickled with (see ml/train.py). Installing a newer scikit-learn still
 # loads the pickle but prints InconsistentVersionWarning on every import.

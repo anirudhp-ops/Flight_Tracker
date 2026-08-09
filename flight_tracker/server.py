@@ -1,17 +1,22 @@
 import asyncio
 from pathlib import Path
+from uuid import uuid4
 
 import redis.asyncio as aioredis
+from aiokafka import AIOKafkaConsumer
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from flight_tracker.cache.redis_cache import CacheLayer
 from flight_tracker.config import settings
 from flight_tracker.db import reader as db_reader
 from flight_tracker.db.writer import create_pool
-from flight_tracker.models.events import FlightEvent
+from flight_tracker.events.dlq_utils import fetch_dlq_events
+from flight_tracker.events.event_model import FlightEventEnvelope
+from flight_tracker.events.kafka_producer import KafkaEventProducer
+from flight_tracker.events import delay_prediction_consumer
 from flight_tracker.graph.engine import GraphEngine
+from flight_tracker.ingestion import consumer_runner
 from flight_tracker.ingestion.worker import run as worker_run
-from flight_tracker.ingestion.publisher import RedisPublisher
 from flight_tracker.ingestion.client import MockFlightAwareClient, FlightAwareClient
 from ml.predictor import DelayPredictor
 
@@ -64,13 +69,37 @@ async def health_db():
 
     return result
 
+
+@app.get("/health/dlq")
+async def health_dlq():
+    """
+    Count of dead-letter-events in the last hour, with a warning flag past
+    settings.kafka_dlq_warning_threshold (default 10). Reads the DLQ topic
+    directly on every call (see dlq_utils.fetch_dlq_events) rather than
+    tracking a running counter — correct and simple at this app's expected
+    DLQ volume, not something to point at a high-failure-rate topic as-is.
+    """
+    events = await fetch_dlq_events(since_hours=1.0)
+    count = len(events)
+    return {
+        "dead_letter_events_last_hour": count,
+        "warning_threshold": settings.kafka_dlq_warning_threshold,
+        "warning": count > settings.kafka_dlq_warning_threshold,
+    }
+
 graph_engine = GraphEngine()
 redis_client = aioredis.from_url(f"redis://{settings.redis_host}:{settings.redis_port}")
 predictor = DelayPredictor(str(Path(__file__).resolve().parent.parent / "ml" / "model.pkl"))
 cache = CacheLayer(redis_client)
+# Shared by the ingestion worker to publish to flight-events. Kafka replaces
+# Redis pub/sub entirely for event streaming as of this phase — redis_client
+# above is used for the cache-aside layer only now (get_cached/set_cached).
+kafka_producer = KafkaEventProducer()
 
 db_pool = None
 worker_task = None
+consumer_runner_task = None
+prediction_consumer_task = None
 
 
 @app.get("/api/flights/{flight_id}")
@@ -103,20 +132,24 @@ async def get_flight_delays(flight_id: str):
     return await cache.get_or_set(cache.key_delays(flight_id), settings.cache_delays_ttl_seconds, loader)
 
 
-def _on_worker_done(task: asyncio.Task) -> None:
-    """Without this, an unhandled exception in the worker loop dies silently."""
-    if task.cancelled():
-        return
-    exc = task.exception()
-    if exc is not None:
-        print(f"FATAL: ingestion worker task crashed and is not running anymore: {exc!r}")
+def _crash_logger(name: str):
+    """Returns a done-callback that logs loudly if `name`'s task dies from
+    an unhandled exception — without this, background tasks fail silently."""
+    def _on_done(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            print(f"FATAL: {name} task crashed and is not running anymore: {exc!r}")
+    return _on_done
 
 
 @app.on_event("startup")
 async def startup():
-    global db_pool, worker_task
+    global db_pool, worker_task, consumer_runner_task, prediction_consumer_task
     db_pool = await create_pool()
     await graph_engine.load_from_db(db_pool, airport_code=settings.target_airport)
+    await kafka_producer.start()
 
     if settings.live_api_enabled:
         client = FlightAwareClient(settings.flightaware_api_key)
@@ -125,28 +158,40 @@ async def startup():
         client = MockFlightAwareClient(settings.target_airport)
         print("Ingestion client: Mock FlightAware Client started (paid API disabled).")
 
-    publisher = RedisPublisher(redis_client)
-    # Keep a reference: an unreferenced asyncio.Task is only weakly held by
+    # Three independent pipeline stages, each its own task — see
+    # flight_tracker/events/KAFKA_ARCHITECTURE.md for the full data flow.
+    # Keep references: an unreferenced asyncio.Task is only weakly held by
     # the event loop and can be garbage-collected mid-run.
     worker_task = asyncio.create_task(
-        worker_run(client, publisher, settings.target_airport, graph_engine)
+        worker_run(client, kafka_producer, settings.target_airport)
     )
-    worker_task.add_done_callback(_on_worker_done)
+    worker_task.add_done_callback(_crash_logger("ingestion worker"))
+
+    consumer_runner_task = asyncio.create_task(consumer_runner.run(settings.target_airport))
+    consumer_runner_task.add_done_callback(_crash_logger("flight-processor consumer"))
+
+    prediction_consumer_task = asyncio.create_task(
+        delay_prediction_consumer.run(graph_engine, predictor)
+    )
+    prediction_consumer_task.add_done_callback(_crash_logger("delay-predictor consumer"))
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    if worker_task is not None:
-        worker_task.remove_done_callback(_on_worker_done)
-        worker_task.cancel()
-        try:
-            await worker_task
-        except asyncio.CancelledError:
-            pass
+    for task in (worker_task, consumer_runner_task, prediction_consumer_task):
+        if task is not None:
+            task.cancel()
+    for task in (worker_task, consumer_runner_task, prediction_consumer_task):
+        if task is not None:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    await kafka_producer.stop()
     if db_pool is not None:
         await db_pool.close()
     await redis_client.aclose()
-    print("Shutdown complete: worker stopped, DB pool closed, Redis client closed.")
+    print("Shutdown complete: all Kafka tasks stopped, producer/DB pool/Redis client closed.")
 
 
 @app.websocket("/ws/{airport_code}")
@@ -159,57 +204,36 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
         if event_obj:
             await websocket.send_text(event_obj.model_dump_json())
 
-    pubsub = redis_client.pubsub()
-    await pubsub.subscribe(f"flights:{airport_code}")
+    # Each connection gets its own throwaway consumer group so every
+    # connected browser tab sees the full delay-predictions stream
+    # independently — in the same group, multiple consumers *split* the
+    # partitions instead of each seeing everything. auto_offset_reset
+    # "latest": the graph dump above already represents current state, so a
+    # newly-connected client doesn't need (and shouldn't get) a replay of
+    # the topic's whole retained history — only what happens from here on.
+    group_id = f"{settings.kafka_consumer_group_websocket}-{uuid4()}"
+    kafka_consumer = AIOKafkaConsumer(
+        settings.kafka_topic_delay_predictions,
+        bootstrap_servers=settings.kafka_bootstrap_servers,
+        group_id=group_id,
+        enable_auto_commit=False,
+        auto_offset_reset="latest",
+    )
+    await kafka_consumer.start()
 
     async def watch_for_disconnect():
         # stream_events() below only ever writes to the socket — it never
         # reads from it, so without this, a closed browser tab is invisible
-        # to the server until the next send_text() happens to fail (up to
-        # POLL_INTERVAL_SECONDS later, or never, if no more events arrive).
+        # to the server until the next send_text() happens to fail.
         # receive_text() raises WebSocketDisconnect the moment the client
         # actually closes.
         while True:
             await websocket.receive_text()
 
     async def stream_events():
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                event = FlightEvent.model_validate_json(message["data"])
-
-                # Add or update the flight event in the graph engine
-                graph_engine.process_event(event)
-
-                if event.delay_minutes > 0:
-                    air_time = event.estimated_air_time_minutes
-                    distance = event.estimated_distance_miles
-                    predicted = predictor.predict(
-                        airline_code=event.airline_code,
-                        origin=event.origin,
-                        destination=event.destination,
-                        dep_delay=event.delay_minutes,
-                        air_time=air_time,
-                        distance=distance,
-                    )
-                    propagated_events = graph_engine.propagate_delay(event.flight_key, event.delay_minutes)
-                    for pe in propagated_events:
-                        await websocket.send_text(pe.model_dump_json())
-                    print(
-                        f"{event.flight_key} — predicted arrival delay: {predicted:.1f} min "
-                        f"(inputs: dep_delay={event.delay_minutes}min, "
-                        f"air_time={air_time:.0f}min, distance={distance:.0f}mi)"
-                    )
-
-                # resolve any gate conflicts after propagation
-                reassignments = graph_engine.resolve_gate_conflicts()
-                if reassignments:
-                    print(f"Gate reassignments: {reassignments}")
-                    for r in reassignments:
-                        updated_event = r.get("event")
-                        if updated_event:
-                            await websocket.send_text(updated_event.model_dump_json())
-
-                await websocket.send_text(event.model_dump_json())
+        async for message in kafka_consumer:
+            envelope = FlightEventEnvelope.from_json(message.value)
+            await websocket.send_text(envelope.flight_event.model_dump_json())
 
     receiver_task = asyncio.create_task(watch_for_disconnect())
     streamer_task = asyncio.create_task(stream_events())
@@ -222,7 +246,7 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
             if not task.done():
                 task.cancel()
         results = await asyncio.gather(receiver_task, streamer_task, return_exceptions=True)
-        await pubsub.unsubscribe(f"flights:{airport_code}")
+        await kafka_consumer.stop()
 
     for result in results:
         if isinstance(result, Exception) and not isinstance(

@@ -63,6 +63,27 @@ class Settings(BaseSettings):
     db_cleanup_interval_seconds: int = Field(default=3600, gt=0)  # 1 hour
     db_cleanup_max_age_hours: float = Field(default=24, gt=0)
 
+    # --- Kafka (flight_tracker/events/) -------------------------------------
+    # The app runs on the host, not inside docker-compose, so it always
+    # dials the host-mapped listener — "localhost:9092", whether that's the
+    # native brew broker or docker-compose's kafka service (both publish on
+    # 9092). KAFKA_BROKER_ADDRESS in .env.example is the in-network address
+    # for when the app itself is containerized later; unused here until then.
+    kafka_bootstrap_servers: str = "localhost:9092"
+
+    kafka_topic_flight_events: str = "flight-events"
+    kafka_topic_processed_flights: str = "processed-flights"
+    kafka_topic_delay_predictions: str = "delay-predictions"
+    kafka_topic_dead_letter: str = "dead-letter-events"
+
+    kafka_consumer_group_processor: str = "flight-processor"
+    kafka_consumer_group_predictor: str = "delay-predictor"
+    kafka_consumer_group_websocket: str = "websocket-stream"
+
+    kafka_consumer_lag_warning_threshold: int = Field(default=100, gt=0)
+    kafka_dlq_warning_threshold: int = Field(default=10, gt=0)
+    kafka_metrics_log_interval_seconds: int = Field(default=10, gt=0)
+
     @field_validator("enable_flightaware_api", mode="before")
     @classmethod
     def _parse_truthy_string(cls, v):
