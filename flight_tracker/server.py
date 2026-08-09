@@ -13,11 +13,11 @@ from flight_tracker.db.writer import create_pool
 from flight_tracker.events.dlq_utils import fetch_dlq_events
 from flight_tracker.events.event_model import FlightEventEnvelope
 from flight_tracker.events.kafka_producer import KafkaEventProducer
-from flight_tracker.events import delay_prediction_consumer
 from flight_tracker.graph.engine import GraphEngine
-from flight_tracker.ingestion import consumer_runner
 from flight_tracker.ingestion.worker import run as worker_run
 from flight_tracker.ingestion.client import MockFlightAwareClient, FlightAwareClient
+from flight_tracker.workers.supervisor import Supervisor
+from flight_tracker.workers.worker_pool import build_worker_pool
 from ml.predictor import DelayPredictor
 
 app = FastAPI()
@@ -98,8 +98,13 @@ kafka_producer = KafkaEventProducer()
 
 db_pool = None
 worker_task = None
-consumer_runner_task = None
-prediction_consumer_task = None
+# Phase E's concurrent worker pool replaces Phase D's single-consumer
+# ingestion/consumer_runner.py + events/delay_prediction_consumer.py for
+# the hot path — both files are kept as reference/fallback but are not
+# started here, to avoid three separate things consuming (and, worse,
+# double-processing) the same topics. See flight_tracker/workers/CONCURRENCY.md.
+supervisor: Supervisor | None = None
+metrics_log_task = None
 
 
 @app.get("/api/flights/{flight_id}")
@@ -146,7 +151,7 @@ def _crash_logger(name: str):
 
 @app.on_event("startup")
 async def startup():
-    global db_pool, worker_task, consumer_runner_task, prediction_consumer_task
+    global db_pool, worker_task, supervisor, metrics_log_task
     db_pool = await create_pool()
     await graph_engine.load_from_db(db_pool, airport_code=settings.target_airport)
     await kafka_producer.start()
@@ -158,8 +163,6 @@ async def startup():
         client = MockFlightAwareClient(settings.target_airport)
         print("Ingestion client: Mock FlightAware Client started (paid API disabled).")
 
-    # Three independent pipeline stages, each its own task — see
-    # flight_tracker/events/KAFKA_ARCHITECTURE.md for the full data flow.
     # Keep references: an unreferenced asyncio.Task is only weakly held by
     # the event loop and can be garbage-collected mid-run.
     worker_task = asyncio.create_task(
@@ -167,31 +170,67 @@ async def startup():
     )
     worker_task.add_done_callback(_crash_logger("ingestion worker"))
 
-    consumer_runner_task = asyncio.create_task(consumer_runner.run(settings.target_airport))
-    consumer_runner_task.add_done_callback(_crash_logger("flight-processor consumer"))
-
-    prediction_consumer_task = asyncio.create_task(
-        delay_prediction_consumer.run(graph_engine, predictor)
+    # WORKER_COUNT concurrent workers consuming flight-events, supervised
+    # (crash -> log -> wait -> restart) — see
+    # flight_tracker/workers/CONCURRENCY.md for the full data flow and why
+    # this replaces Phase D's two single-consumer stages.
+    processed_producer = KafkaEventProducer()
+    prediction_producer = KafkaEventProducer()
+    await processed_producer.start()
+    await prediction_producer.start()
+    pool_obj = build_worker_pool(
+        pool=db_pool,
+        redis_client=redis_client,
+        graph_engine=graph_engine,
+        predictor=predictor,
+        processed_producer=processed_producer,
+        prediction_producer=prediction_producer,
+        airport_code=settings.target_airport,
     )
-    prediction_consumer_task.add_done_callback(_crash_logger("delay-predictor consumer"))
+    supervisor = Supervisor(pool_obj)
+    await supervisor.start()
+    supervisor_task = asyncio.create_task(supervisor.run_forever())
+    supervisor_task.add_done_callback(_crash_logger("worker pool supervisor"))
+    metrics_log_task = asyncio.create_task(supervisor.run_periodic_metrics_logging())
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    for task in (worker_task, consumer_runner_task, prediction_consumer_task):
-        if task is not None:
-            task.cancel()
-    for task in (worker_task, consumer_runner_task, prediction_consumer_task):
-        if task is not None:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+    if worker_task is not None:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+
+    if metrics_log_task is not None:
+        metrics_log_task.cancel()
+        try:
+            await metrics_log_task
+        except asyncio.CancelledError:
+            pass
+
+    if supervisor is not None:
+        # "Finish in-flight events (timeout: 30s)" — Worker.run() already
+        # finishes whatever message it's mid-processing before honoring
+        # _stopping (see worker_pool.py), so this timeout is a backstop
+        # against something hanging (a wedged DB/Kafka call outlasting its
+        # own retry budget), not the normal-case wait.
+        try:
+            await asyncio.wait_for(
+                supervisor.stop(), timeout=settings.worker_shutdown_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            print(
+                f"WARNING: worker pool did not shut down within "
+                f"{settings.worker_shutdown_timeout_seconds}s — proceeding with shutdown anyway"
+            )
+
     await kafka_producer.stop()
     if db_pool is not None:
         await db_pool.close()
     await redis_client.aclose()
-    print("Shutdown complete: all Kafka tasks stopped, producer/DB pool/Redis client closed.")
+    print("Shutdown complete: worker pool + ingestion worker stopped, producer/DB pool/Redis client closed.")
 
 
 @app.websocket("/ws/{airport_code}")

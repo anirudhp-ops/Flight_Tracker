@@ -31,3 +31,11 @@ scikit-learn==1.7.2
 
 # ml/train.py only (not needed to run the server).
 pandas==3.0.5
+
+# flight_tracker/tests/ only — real tests against live Postgres/Redis/Kafka,
+# no mocks (see the test file's own docstring for why).
+pytest==9.1.1
+pytest-asyncio==1.4.0
+
+# scripts/load_test_workers.py only — process-level CPU/memory sampling.
+psutil==7.2.2

@@ -9,16 +9,12 @@ dedupes retried sends server-side, so a network blip retry can't double-
 publish), capped in-flight requests (required for idempotence to also
 guarantee ordering — Kafka's own constraint, not a made-up number).
 """
-import asyncio
-
 from aiokafka import AIOKafkaProducer
 from aiokafka.errors import KafkaError
 
 from flight_tracker.config import settings
 from flight_tracker.events.event_model import FlightEventEnvelope
-
-MAX_PUBLISH_RETRIES = 3
-RETRY_BACKOFF_SECONDS = 1.0
+from flight_tracker.workers.retry import retry_with_backoff
 
 
 class KafkaEventProducer:
@@ -54,14 +50,20 @@ class KafkaEventProducer:
                 f"send_failures={self.send_failures})"
             )
 
+    @retry_with_backoff(exceptions=(KafkaError,))
+    async def _send(self, topic: str, value: bytes, key: bytes) -> None:
+        await self._producer.send_and_wait(topic, value=value, key=key)
+
     async def publish(self, topic: str, event: FlightEventEnvelope):
         """
         Publishes `event` to `topic`, keyed by flight_id so every event for
         a given flight lands on the same partition (aiokafka's default
         partitioner hashes the key) — same-flight events stay in order.
-        Retries transient producer errors (broker unavailable, timeout) with
-        backoff; raises the last error if every attempt fails. Returns
-        event.event_id on success.
+        Retries transient producer errors (broker unavailable, timeout) via
+        @retry_with_backoff (flight_tracker/workers/retry.py — settings.worker_retry_*),
+        the same retry mechanism Phase E's DB writes use, rather than a
+        second, differently-tuned bespoke retry loop. Raises if every
+        attempt fails. Returns event.event_id on success.
         """
         if self._producer is None:
             raise RuntimeError("KafkaEventProducer.start() must be called before publish()")
@@ -69,20 +71,10 @@ class KafkaEventProducer:
         key = event.flight_id.encode("utf-8")
         value = event.to_json().encode("utf-8")
 
-        last_error: Exception | None = None
-        for attempt in range(1, MAX_PUBLISH_RETRIES + 1):
-            try:
-                await self._producer.send_and_wait(topic, value=value, key=key)
-                self.events_sent += 1
-                return event.event_id
-            except KafkaError as e:
-                last_error = e
-                self.send_failures += 1
-                print(
-                    f"KafkaEventProducer: publish attempt {attempt}/{MAX_PUBLISH_RETRIES} "
-                    f"to {topic} failed: {e!r}"
-                )
-                if attempt < MAX_PUBLISH_RETRIES:
-                    await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
-
-        raise last_error
+        try:
+            await self._send(topic, value, key)
+        except KafkaError:
+            self.send_failures += 1
+            raise
+        self.events_sent += 1
+        return event.event_id

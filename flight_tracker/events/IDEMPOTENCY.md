@@ -1,5 +1,12 @@
 # Delivery semantics: at-least-once, not exactly-once
 
+> **Update (Phase E)**: the "What idempotency does NOT cover" section below
+> was accurate for Phase D but is now **wrong about `flight_events`** — see
+> "Phase E: flight_events becomes idempotent too" at the end of this file
+> for what changed, why, and what's still true from the original text below
+> (kept as-is rather than silently edited, since the reasoning that led to
+> the original decision is still worth having on record).
+
 **Chosen: at-least-once delivery** — Kafka's default, and what this app
 actually implements end to end. Exactly-once semantics (Kafka transactions
 across the producer → consumer → DB write) were not built.
@@ -74,4 +81,59 @@ flight_events:  2 rows (same flight_key, same delay_minutes, same captured_at)
 ```
 
 Exactly the split described above: current-state table stayed idempotent,
-history log recorded both deliveries.
+history log recorded both deliveries. **This specific outcome (2 rows in
+flight_events) no longer reproduces after Phase E — see below.**
+
+## Phase E: flight_events becomes idempotent too
+
+`flight_tracker/workers/CONCURRENCY.md`'s phase brief specified a real
+`UNIQUE(flight_id, event_timestamp)` database constraint for idempotency,
+which directly contradicts the Phase D decision above ("`flight_events` is
+not idempotent, on purpose"). Rather than silently ignore the new
+instruction to preserve the old doc's consistency, or silently rewrite
+history to pretend this was always the plan: **the Phase D reasoning was
+reconsidered and the decision changed.**
+
+**What changed**: `db/writer.py` now has a `UNIQUE` index on
+`flight_events (flight_id, captured_at)` (`captured_at` is the real column
+name — see the "corrected from the original spec" note above, which still
+applies), and `write_events()` inserts with `ON CONFLICT (flight_id,
+captured_at) DO NOTHING`. A required one-time migration deleted 214
+pre-existing duplicate-group rows that had accumulated during Phase D's
+deliberately-non-deduplicated period, before the unique index could even
+be created (`CREATE UNIQUE INDEX` fails outright on data that already
+violates it) — see the migration comment in `db/writer.py` for the exact
+`DELETE` used.
+
+**Why the reconsideration is a real improvement, not just spec-following**:
+Phase E adds `WORKER_COUNT` concurrent workers and a Redis idempotency
+cache (`processed:{flight_id}:{timestamp}`, `event_processor.py`) as a
+fast-path optimization to skip redundant processing. That cache can go
+stale, get evicted, or simply not exist yet right after a Redis restart —
+at which point, under Phase D's rules, a redelivered event would produce a
+second `flight_events` row with no guard at all. The original argument
+against deduplicating flight_events ("deciding which of two identical
+delivery attempts really happened is a harder problem than it sounds") is
+still true in general, but doesn't actually apply here: `ON CONFLICT DO
+NOTHING` doesn't decide between two attempts, it just keeps whichever
+landed first and discards an exact byte-for-byte duplicate — no
+ambiguity, because "exact duplicate" is a well-defined concept
+(`flight_id` + `captured_at` matching) while "which delivery is more
+correct" would not have been.
+
+**What's still true from the Phase D reasoning above**: the DLQ's
+non-deduplication (a message failing twice produces two DLQ records) is
+unaffected — dead-letter-events has no unique constraint and none is
+planned; DLQ volume stays low enough that this remains acceptable noise.
+And the core at-least-once-not-exactly-once choice at the top of this file
+is unchanged — this update only tightens what happens when the *same*
+event is delivered more than once, not the overall delivery guarantee.
+
+**Verified** (`flight_tracker/tests/test_workers.py`,
+`test_idempotency_db_constraint_prevents_duplicate_flight_events`):
+publishing the identical `(flight_id, timestamp)` event twice through
+`write_events()` now produces exactly **one** `flight_events` row, not
+two. A companion test
+(`test_idempotency_different_timestamps_both_recorded`) confirms two
+genuinely different events for the same `flight_id` are still both
+recorded — only exact duplicates are discarded.

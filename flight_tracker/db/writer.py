@@ -61,7 +61,33 @@ ALTER TABLE active_flights ADD COLUMN IF NOT EXISTS airport_code TEXT;
 -- TARGET_AIRPORT). New rows get the real value from write_events().
 UPDATE active_flights SET airport_code = origin WHERE airport_code IS NULL;
 
-CREATE INDEX IF NOT EXISTS idx_flight_events_flight_id_captured_at
+-- Phase E supersedes the Phase D decision that flight_events was
+-- deliberately non-idempotent (see IDEMPOTENCY.md, which now documents
+-- this change and why). A unique index on (flight_id, captured_at) serves
+-- the same query-acceleration purpose the old plain index did AND lets
+-- write_events() use ON CONFLICT (flight_id, captured_at) DO NOTHING, so
+-- an exact-duplicate delivery (same flight_id, same event timestamp) is
+-- rejected at the database level instead of relying solely on the Redis
+-- idempotency cache (flight_tracker/workers/event_processor.py), which can
+-- go stale, get evicted, or simply not exist yet after a Redis restart.
+-- Replaces idx_flight_events_flight_id_captured_at (Phase C) — a plain and
+-- a unique index on the identical columns would be redundant.
+DROP INDEX IF EXISTS idx_flight_events_flight_id_captured_at;
+
+-- One-time cleanup before the unique index can even be created: Phase D's
+-- flight_events was deliberately append-only/non-deduplicated, so real
+-- duplicate (flight_id, captured_at) rows already exist from that period
+-- (idempotency testing, retried publishes, etc.) — CREATE UNIQUE INDEX
+-- fails outright on data that already violates the constraint. Keeps the
+-- earliest row (lowest id) per duplicate group, drops the rest. Idempotent:
+-- a re-run finds nothing left to delete once this has run once.
+DELETE FROM flight_events a
+USING flight_events b
+WHERE a.id > b.id
+  AND a.flight_id = b.flight_id
+  AND a.captured_at = b.captured_at;
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_flight_events_flight_id_captured_at
     ON flight_events (flight_id, captured_at);
 
 CREATE INDEX IF NOT EXISTS idx_active_flights_airport_code_last_updated
@@ -129,6 +155,7 @@ async def write_events(pool, events: list[FlightEvent], airport_code: str | None
                     scheduled_arrival, estimated_arrival, actual_arrival,
                     delay_minutes, status, passenger_count, captured_at
                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                ON CONFLICT (flight_id, captured_at) DO NOTHING
                 """, event_rows,
             )
             await conn.executemany(

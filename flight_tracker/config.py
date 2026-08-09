@@ -46,11 +46,15 @@ class Settings(BaseSettings):
     db_user: str = "postgres"
     db_password: Optional[str] = None
 
-    # asyncpg pool sizing — see flight_tracker/db/OPTIMIZATION.md for the
-    # rationale behind these specific numbers (min/max size, connection
-    # recycling via max_queries, prepared-statement cache lifetime).
-    db_pool_min_size: int = Field(default=10, gt=0)
-    db_pool_max_size: int = Field(default=20, gt=0)
+    # asyncpg pool sizing — see flight_tracker/db/OPTIMIZATION.md (Phase C)
+    # and flight_tracker/workers/CONCURRENCY.md (Phase E) for the rationale.
+    # Bumped from 10/20 (Phase C) to 20/50 (Phase E) to give WORKER_COUNT
+    # concurrent workers room to write without queuing on pool.acquire() —
+    # sized for ONE shared pool (server.py's own startup use plus the
+    # worker pool reuse it, not a pool each) specifically so this stays
+    # well under the local Postgres's max_connections=100.
+    db_pool_min_size: int = Field(default=20, gt=0)
+    db_pool_max_size: int = Field(default=50, gt=0)
     db_pool_max_queries: int = Field(default=50000, gt=0)
     db_pool_max_cached_statement_lifetime: int = Field(default=300, ge=0)
 
@@ -83,6 +87,40 @@ class Settings(BaseSettings):
     kafka_consumer_lag_warning_threshold: int = Field(default=100, gt=0)
     kafka_dlq_warning_threshold: int = Field(default=10, gt=0)
     kafka_metrics_log_interval_seconds: int = Field(default=10, gt=0)
+
+    # --- Concurrent worker pool (flight_tracker/workers/) -------------------
+    # Replaces the single-consumer flight-processor + delay-predictor split
+    # from Phase D for the hot path — see CONCURRENCY.md for why. Consumes
+    # flight-events directly under its own group so it doesn't compete with
+    # (or double-process alongside) the Phase D consumers if those are ever
+    # started too.
+    worker_count: int = Field(default=4, gt=0)
+    kafka_consumer_group_worker_pool: str = "event-processor-pool"
+
+    worker_retry_max_attempts: int = Field(default=3, gt=0)
+    worker_retry_initial_delay_ms: int = Field(default=100, gt=0)
+    worker_retry_max_delay_ms: int = Field(default=30000, gt=0)
+    worker_retry_backoff_factor: float = Field(default=2.0, gt=1.0)
+    worker_retry_jitter_fraction: float = Field(default=0.1, ge=0, lt=1.0)
+
+    worker_backpressure_lag_threshold: int = Field(default=1000, gt=0)
+    worker_backpressure_low_lag_threshold: int = Field(default=10, ge=0)
+    worker_backpressure_throttle_seconds: float = Field(default=0.05, ge=0)
+
+    worker_idempotency_cache_ttl_seconds: int = Field(default=3600, gt=0)  # 1 hour
+
+    worker_supervisor_restart_delay_seconds: float = Field(default=5.0, ge=0)
+    worker_shutdown_timeout_seconds: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode="after")
+    def _backpressure_thresholds_sane(self):
+        if self.worker_backpressure_low_lag_threshold >= self.worker_backpressure_lag_threshold:
+            raise ValueError(
+                f"worker_backpressure_low_lag_threshold "
+                f"({self.worker_backpressure_low_lag_threshold}) must be < "
+                f"worker_backpressure_lag_threshold ({self.worker_backpressure_lag_threshold})"
+            )
+        return self
 
     @field_validator("enable_flightaware_api", mode="before")
     @classmethod
