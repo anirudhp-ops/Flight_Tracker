@@ -1,0 +1,47 @@
+# Prometheus scrape configuration (Phase J). Loaded by the `prometheus`
+# service in docker-compose.yml.
+#
+# Only one real scrape target exists today: the FastAPI backend's own
+# GET /metrics (flight_tracker/metrics/, exposed by flight_tracker/server.py).
+# There is deliberately no `kafka` scrape job here, unlike the Phase J brief's
+# literal pseudocode (`targets: ['kafka:9092']`) — 9092 is Kafka's native
+# broker protocol port, not an HTTP/Prometheus text-format endpoint; scraping
+# it would just fail every 15s. Getting real Kafka metrics needs a JMX
+# exporter (either the Confluent/Bitnami "kafka-exporter" sidecar, or the
+# JMX Prometheus javaagent on the broker itself) — infrastructure this
+# project doesn't currently run. Consumer lag, the one Kafka number this
+# project actually cares about operationally (see
+# flight_tracker/workers/CONCURRENCY.md), is already tracked without it: the
+# app itself computes it per consumer group (flight_tracker/workers/
+# supervisor.py, via each Worker's own .lag()) and exposes it as the
+# kafka_consumer_lag gauge below — scraped from flight-backend, not from
+# Kafka directly.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alert_rules.yml
+
+scrape_configs:
+  - job_name: 'flight-backend'
+    static_configs:
+      # The backend runs on the host (uvicorn flight_tracker.server:app),
+      # not as a docker-compose service — see this repo's docker-compose.yml
+      # header comment for why (Postgres/Redis/Kafka are containerized,
+      # the app isn't, yet). From inside the `prometheus` container,
+      # "localhost" would mean the container itself, not the host, so this
+      # targets Docker Desktop's host-loopback DNS name instead. Linux hosts
+      # without Docker Desktop don't resolve this name — pass
+      # --add-host=host.docker.internal:host-gateway to the container (or
+      # run Docker 20.10+, which wires it up automatically) if scraping
+      # fails there.
+      - targets: ['host.docker.internal:8000']
+    metrics_path: '/metrics'
+
+  # Prometheus scraping itself — standard practice, useful for confirming
+  # the scraper process itself is up and to alert on scrape failures of the
+  # job above (see alert_rules.yml's BackendDown).
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

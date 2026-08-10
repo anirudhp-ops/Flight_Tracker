@@ -28,6 +28,7 @@ start()/stop()/run(), a .processor with the same counters, .restarts,
 wiring (Phase F task #74).
 """
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -39,10 +40,22 @@ from flight_tracker.config import settings
 from flight_tracker.events.event_model import FlightEventEnvelope
 from flight_tracker.events.kafka_producer import KafkaEventProducer
 from flight_tracker.graph.engine import GraphEngine
+from flight_tracker.metrics import (
+    event_processing_latency,
+    events_failed,
+    events_received,
+    graph_edge_count,
+    graph_node_count,
+    predictions_generated,
+    propagation_latency,
+    propagations_triggered,
+)
 from flight_tracker.models.events import FlightEvent
 from flight_tracker.models.prediction_event import GateReassignmentDetail, PredictionEvent
 from flight_tracker.workers.failure_handler import FailureHandler
 from ml.predictor import DelayPredictor
+
+logger = logging.getLogger(__name__)
 
 
 class _RebalanceLogger(ConsumerRebalanceListener):
@@ -97,10 +110,11 @@ class DelayPropagationProcessor:
     """
 
     def __init__(self, graph_engine: GraphEngine, predictor: DelayPredictor,
-                 prediction_producer: KafkaEventProducer):
+                 prediction_producer: KafkaEventProducer, worker_id: str = "delay-propagation-0"):
         self._graph_engine = graph_engine
         self._predictor = predictor
         self._prediction_producer = prediction_producer
+        self._worker_id = worker_id
 
         self.events_processed = 0
         self.events_failed = 0
@@ -123,6 +137,8 @@ class DelayPropagationProcessor:
             # delayed flight, so the graph must stay complete regardless of
             # whether *this* event is itself a delay.
             self._graph_engine.process_event(event)
+            graph_node_count.set(self._graph_engine.graph.number_of_nodes())
+            graph_edge_count.set(self._graph_engine.graph.number_of_edges())
 
             # Also unconditional, and also matching preserved behavior —
             # this deviates from the task brief's pseudocode, which nests
@@ -148,7 +164,10 @@ class DelayPropagationProcessor:
                     air_time=event.estimated_air_time_minutes,
                     distance=event.estimated_distance_miles,
                 )
+                propagations_triggered.inc()
+                propagation_start = time.perf_counter()
                 propagated = self._graph_engine.propagate_delay(event.flight_key, event.delay_minutes)
+                propagation_latency.observe(time.perf_counter() - propagation_start)
 
             # Always publish for the triggering flight itself, even a
             # non-delayed one, so the frontend keeps seeing every flight on
@@ -212,11 +231,34 @@ class DelayPropagationProcessor:
                     ),
                 )
 
+            elapsed_seconds = time.perf_counter() - start
             self.events_processed += 1
-            self.latencies_ms.append((time.perf_counter() - start) * 1000)
+            self.latencies_ms.append(elapsed_seconds * 1000)
+            event_processing_latency.observe(elapsed_seconds)
+            logger.info(
+                "Delay propagation processed",
+                extra={
+                    "request_id": str(envelope.event_id),
+                    "flight_id": event.flight_id,
+                    "worker_id": self._worker_id,
+                    "latency_ms": round(elapsed_seconds * 1000, 3),
+                    "propagated_count": len(propagated),
+                    "gate_reassignments": len(reassignments),
+                },
+            )
             return True, None
         except Exception as e:
             self.events_failed += 1
+            events_failed.labels(reason=type(e).__name__).inc()
+            logger.error(
+                "Delay propagation processing failed",
+                extra={
+                    "request_id": str(envelope.event_id),
+                    "flight_id": envelope.flight_id,
+                    "worker_id": self._worker_id,
+                },
+                exc_info=e,
+            )
             return False, e
 
     async def _publish(
@@ -240,6 +282,7 @@ class DelayPropagationProcessor:
             propagation_hops=propagation_hops,
         )
         await self._prediction_producer.publish(settings.kafka_topic_delay_predictions, prediction)
+        predictions_generated.inc()
 
 
 class DelayPropagationWorker:
@@ -254,7 +297,9 @@ class DelayPropagationWorker:
         prediction_producer: KafkaEventProducer,
     ):
         self.worker_id = worker_id
-        self.processor = DelayPropagationProcessor(graph_engine, predictor, prediction_producer)
+        self.processor = DelayPropagationProcessor(
+            graph_engine, predictor, prediction_producer, worker_id=worker_id
+        )
         self.restarts = 0  # bumped by the Supervisor, not this class — matches Worker
         self._consumer: AIOKafkaConsumer | None = None
         self._dlq_producer: AIOKafkaProducer | None = None
@@ -324,6 +369,8 @@ class DelayPropagationWorker:
             async for message in self._consumer:
                 if self._stopping:
                     break
+
+                events_received.labels(topic=message.topic).inc()
 
                 event_id = None
                 flight_id = None

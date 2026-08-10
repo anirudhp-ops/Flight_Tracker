@@ -1,0 +1,15 @@
+# Auto-provisions the Prometheus datasource on Grafana container startup —
+# no manual "Add data source" click-through needed. uid is fixed to
+# "prometheus" deliberately: flight_tracker/observability/grafana_dashboard.json's
+# panels reference this exact uid in their datasource fields, and a
+# mismatch there is a silent "no data" on every panel, not an error.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

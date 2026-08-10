@@ -5,3 +5,14 @@ ml/model.pkl
 *.pkl
 T_ONTIME_MARKETING.csv
 *.csv
+
+# Phase I test/benchmark run output — regenerate via the commands in
+# flight_tracker/TESTING.md; flight_tracker/LOAD_TEST_REPORT.md is the
+# durable, checked-in snapshot of a specific run.
+.coverage
+htmlcov/
+coverage.xml
+frontend/coverage/
+scripts/*_results.json
+scripts/k6_summary.json
+scripts/observability_test_server.log

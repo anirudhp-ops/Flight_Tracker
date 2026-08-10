@@ -22,6 +22,7 @@ papering over it further. This pipeline is now pure persistence: nothing
 here needs coordinating across workers beyond what the DB pool and Kafka
 producer already provide.
 """
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -32,8 +33,11 @@ from flight_tracker.config import settings
 from flight_tracker.db.writer import write_events
 from flight_tracker.events.event_model import FlightEventEnvelope
 from flight_tracker.events.kafka_producer import KafkaEventProducer
+from flight_tracker.metrics import event_processing_latency, events_failed, events_processed
 from flight_tracker.models.events import FlightEvent
 from flight_tracker.workers.retry import retry_with_backoff
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -104,6 +108,14 @@ class AsyncEventProcessor:
             already_processed = await self._redis.get(idem_key)
             if already_processed:
                 self.idempotent_skips += 1
+                logger.info(
+                    "Idempotent skip",
+                    extra={
+                        "request_id": str(envelope.event_id),
+                        "flight_id": event.flight_id,
+                        "worker_id": self.worker_id,
+                    },
+                )
                 return True, ProcessResult(event=event, idempotent_skip=True), None
 
             await self._write_to_db_retrying(event)
@@ -111,12 +123,34 @@ class AsyncEventProcessor:
 
             await self._redis.set(idem_key, "1", ex=settings.worker_idempotency_cache_ttl_seconds)
 
+            elapsed_seconds = time.perf_counter() - start
             self.events_processed += 1
-            self.latencies_ms.append((time.perf_counter() - start) * 1000)
+            self.latencies_ms.append(elapsed_seconds * 1000)
+            events_processed.labels(worker_id=self.worker_id).inc()
+            event_processing_latency.observe(elapsed_seconds)
+            logger.info(
+                "Event processed",
+                extra={
+                    "request_id": str(envelope.event_id),
+                    "flight_id": event.flight_id,
+                    "worker_id": self.worker_id,
+                    "latency_ms": round(elapsed_seconds * 1000, 3),
+                },
+            )
 
             return True, ProcessResult(event=event), None
         except Exception as e:
             self.events_failed += 1
+            events_failed.labels(reason=type(e).__name__).inc()
+            logger.error(
+                "Event processing failed",
+                extra={
+                    "request_id": str(envelope.event_id),
+                    "flight_id": envelope.flight_id,
+                    "worker_id": self.worker_id,
+                },
+                exc_info=e,
+            )
             return False, None, e
 
     async def _write_to_db_once(self, event: FlightEvent) -> None:

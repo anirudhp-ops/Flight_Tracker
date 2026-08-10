@@ -13,6 +13,7 @@ flight_tracker/workers/supervisor.py's job, deliberately kept separate so
 into one class.
 """
 import asyncio
+import logging
 
 import redis.asyncio as aioredis
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -21,8 +22,11 @@ from aiokafka.abc import ConsumerRebalanceListener
 from flight_tracker.config import settings
 from flight_tracker.events.event_model import FlightEventEnvelope
 from flight_tracker.events.kafka_producer import KafkaEventProducer
+from flight_tracker.metrics import events_received
 from flight_tracker.workers.event_processor import AsyncEventProcessor
 from flight_tracker.workers.failure_handler import FailureHandler
+
+logger = logging.getLogger(__name__)
 
 
 class _RebalanceLogger(ConsumerRebalanceListener):
@@ -113,13 +117,14 @@ class Worker:
                 if self._stopping:
                     break
 
+                events_received.labels(topic=message.topic).inc()
+
                 # --- Backpressure (task 5) ---------------------------------
                 current_lag = await self.lag()
                 if current_lag > settings.worker_backpressure_lag_threshold:
-                    print(
-                        f"WARNING: Worker {self.worker_id} consumer lag high "
-                        f"({current_lag} > {settings.worker_backpressure_lag_threshold}), "
-                        f"reducing throughput"
+                    logger.warning(
+                        "Consumer lag high, reducing throughput",
+                        extra={"worker_id": self.worker_id, "lag": current_lag},
                     )
                     await asyncio.sleep(settings.worker_backpressure_throttle_seconds)
                 # lag < worker_backpressure_low_lag_threshold: no throttle —

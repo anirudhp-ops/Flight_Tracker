@@ -1,13 +1,18 @@
 import asyncio
 import json
+import logging
+import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 import redis.asyncio as aioredis
 from aiokafka import AIOKafkaConsumer
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
 from flight_tracker.cache.redis_cache import CacheLayer
 from flight_tracker.config import settings
 from flight_tracker.db import reader as db_reader
@@ -17,6 +22,9 @@ from flight_tracker.events.kafka_producer import KafkaEventProducer
 from flight_tracker.graph.engine import GraphEngine
 from flight_tracker.ingestion.worker import run as worker_run
 from flight_tracker.ingestion.client import MockFlightAwareClient, FlightAwareClient
+from flight_tracker.logging_config import configure_logging
+from flight_tracker.metrics import active_websocket_connections, websocket_message_latency
+from flight_tracker.middleware.request_id import add_request_id
 from flight_tracker.models.prediction_event import PredictionEvent
 from flight_tracker.websocket.messages import (
     WSMessageType,
@@ -28,6 +36,14 @@ from flight_tracker.workers.delay_propagation_worker import build_delay_propagat
 from flight_tracker.workers.supervisor import Supervisor
 from flight_tracker.workers.worker_pool import WorkerPool, build_worker_pool
 from ml.predictor import DelayPredictor
+
+# Before any logger.*() call below (or in any module this one imports and
+# whose code path runs at request time) — attaches the JSON-formatting
+# handler to the root logger once, at process import time. See
+# flight_tracker/logging_config.py.
+configure_logging()
+logger = logging.getLogger(__name__)
+SERVER_START_TIME = time.monotonic()
 
 WS_HEARTBEAT_INTERVAL_SECONDS = 30
 WS_HISTORY_MAX_MESSAGES = 100
@@ -42,6 +58,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.middleware("http")(add_request_id)
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus scrape target — see prometheus.yml's flight-backend job."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/api/config")
 async def get_config():
@@ -80,6 +103,65 @@ async def health_db():
         result["redis"] = f"error: {e!r}"
 
     return result
+
+
+@app.get("/health")
+async def health():
+    """
+    Aggregated liveness/metrics snapshot (Phase J task 7) — a single call a
+    dashboard or uptime check can hit, unlike /health/db and /health/dlq
+    above (kept as-is: more detail than this summary needs on every poll).
+    events_per_second is a cumulative average since process start, not a
+    trailing window — the periodic per-second number lives in Prometheus
+    (rate(events_processed_total[1m]) via /metrics), which is the right
+    tool for a real rate; this endpoint just needs to say "alive and
+    roughly how busy," not replace Grafana.
+    """
+    services = {"database": "unknown", "redis": "unknown", "kafka": "unknown"}
+
+    if db_pool is not None:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            services["database"] = "ok"
+        except Exception as e:
+            services["database"] = f"error: {e!r}"
+    else:
+        services["database"] = "not initialized"
+
+    try:
+        services["redis"] = "ok" if await redis_client.ping() else "no response"
+    except Exception as e:
+        services["redis"] = f"error: {e!r}"
+
+    services["kafka"] = "ok" if kafka_producer._producer is not None else "not started"
+
+    processed = 0
+    failed = 0
+    latencies_ms: list[float] = []
+    consumer_lag = 0
+    for sup in (supervisor, delay_propagation_supervisor):
+        if sup is None:
+            continue
+        processed += sup.pool.total_events_processed
+        failed += sup.pool.total_events_failed
+        latencies_ms.extend(sup.pool.all_latencies_ms())
+        consumer_lag += await sup.pool.total_lag()
+
+    elapsed = max(time.monotonic() - SERVER_START_TIME, 1e-9)
+    total = processed + failed
+
+    return {
+        "status": "healthy" if all(v == "ok" for v in services.values()) else "degraded",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": services,
+        "metrics": {
+            "events_per_second": round(processed / elapsed, 2),
+            "avg_latency_ms": round(sum(latencies_ms) / len(latencies_ms), 2) if latencies_ms else 0.0,
+            "error_rate": round(failed / total, 4) if total else 0.0,
+            "consumer_lag": consumer_lag,
+        },
+    }
 
 
 @app.get("/health/dlq")
@@ -180,7 +262,7 @@ def _crash_logger(name: str):
             return
         exc = task.exception()
         if exc is not None:
-            print(f"FATAL: {name} task crashed and is not running anymore: {exc!r}")
+            logger.critical(f"{name} task crashed and is not running anymore", exc_info=exc)
     return _on_done
 
 
@@ -219,7 +301,7 @@ async def startup():
         processed_producer=processed_producer,
         airport_code=settings.target_airport,
     )
-    supervisor = Supervisor(pool_obj)
+    supervisor = Supervisor(pool_obj, consumer_group=settings.kafka_consumer_group_worker_pool)
     await supervisor.start()
     supervisor_task = asyncio.create_task(supervisor.run_forever())
     supervisor_task.add_done_callback(_crash_logger("worker pool supervisor"))
@@ -236,7 +318,9 @@ async def startup():
         prediction_producer=prediction_producer,
     )
     delay_propagation_pool = WorkerPool([delay_propagation_worker])
-    delay_propagation_supervisor = Supervisor(delay_propagation_pool)
+    delay_propagation_supervisor = Supervisor(
+        delay_propagation_pool, consumer_group=settings.kafka_consumer_group_predictor
+    )
     await delay_propagation_supervisor.start()
     delay_propagation_supervisor_task = asyncio.create_task(delay_propagation_supervisor.run_forever())
     delay_propagation_supervisor_task.add_done_callback(_crash_logger("delay propagation supervisor"))
@@ -320,123 +404,140 @@ async def websocket_endpoint(websocket: WebSocket, airport_code: str):
     not guarantee is safe.
     """
     await websocket.accept()
-
-    outbox: asyncio.Queue = asyncio.Queue()
-    # Mutable holder (not a bare variable) so both the receiver task
-    # (writes, on a client "subscribe"/"unsubscribe" message) and the
-    # stream task (reads, to decide what to forward) can share it via
-    # closure without a `nonlocal` per task.
-    sub_state = {"flight_id": None}
-
-    # SNAPSHOT first: current graph_engine state for this airport, built
-    # fresh per connection rather than cached — matches the old dump-on-
-    # connect behavior, just now typed and batched into one message
-    # instead of one send_text() per flight.
-    snapshot_flights = [
-        attrs["event"].model_dump(mode="json")
-        for _, attrs in graph_engine.graph.nodes(data=True)
-        if attrs.get("event") is not None
-    ]
-    await websocket.send_text(snapshot_message(snapshot_flights).to_json())
-
-    # Bounded history replay for late joiners — see recent_ws_messages'
-    # own comment for why this is a shared buffer, not per-connection.
-    for historical_msg in list(recent_ws_messages):
-        await websocket.send_text(historical_msg.to_json())
-
-    # Each connection gets its own throwaway consumer group so every
-    # connected browser tab sees the full delay-predictions stream
-    # independently — in the same group, multiple consumers *split* the
-    # partitions instead of each seeing everything. auto_offset_reset
-    # "latest": the snapshot+history above already cover current/recent
-    # state, so a newly-connected client doesn't need (and shouldn't get) a
-    # replay of the topic's whole retained history too.
-    group_id = f"{settings.kafka_consumer_group_websocket}-{uuid4()}"
-    kafka_consumer = AIOKafkaConsumer(
-        settings.kafka_topic_delay_predictions,
-        bootstrap_servers=settings.kafka_bootstrap_servers,
-        group_id=group_id,
-        enable_auto_commit=False,
-        auto_offset_reset="latest",
+    request_id = str(uuid4())
+    active_websocket_connections.inc()
+    logger.info(
+        "WebSocket connected",
+        extra={"request_id": request_id, "flight_id": airport_code},
     )
-    await kafka_consumer.start()
 
-    async def watch_for_disconnect():
-        # Also the only reader of client-sent frames, so this is where an
-        # optional {"action":"subscribe","flight_id":...}/{"action":
-        # "unsubscribe"} message (task 1's "optional: subscribe to a
-        # specific flight_id") gets applied. Malformed/unrecognized frames
-        # are ignored, not fatal — a stray or future-versioned client
-        # message shouldn't kill the connection. receive_text() raising
-        # WebSocketDisconnect the moment the client actually closes is
-        # still what detects a dead client — without a reader at all, a
-        # closed tab is invisible to the server until the next
-        # send_text() happens to fail.
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                msg = json.loads(raw)
-            except (TypeError, ValueError):
-                continue
-            action = msg.get("action")
-            if action == "subscribe" and msg.get("flight_id"):
-                sub_state["flight_id"] = msg["flight_id"]
-            elif action == "unsubscribe":
-                sub_state["flight_id"] = None
-
-    def _passes_filter(ws_msg) -> bool:
-        flight_id = sub_state["flight_id"]
-        if flight_id is None:
-            return True
-        if ws_msg.flight_id == flight_id:
-            return True
-        # A client watching one flight should still see cascades that
-        # originate from it, not just direct updates to it.
-        return ws_msg.data.get("propagation_source") == flight_id
-
-    async def stream_events():
-        # delay-predictions carries PredictionEvent (Phase F); each maps to
-        # exactly one typed WSMessage (Phase G) via classify_prediction_event.
-        async for message in kafka_consumer:
-            prediction = PredictionEvent.from_json(message.value)
-            ws_msg = classify_prediction_event(prediction)
-            recent_ws_messages.append(ws_msg)
-            if _passes_filter(ws_msg):
-                await outbox.put(ws_msg)
-
-    async def send_heartbeats():
-        # App-level heartbeat, not a raw WS ping/pong frame: the frontend
-        # needs something it can observe through the same onmessage handler
-        # it already has, to detect "socket claims open but nothing — not
-        # even a heartbeat — has arrived in N seconds" without a separate
-        # low-level ping/pong API.
-        while True:
-            await asyncio.sleep(WS_HEARTBEAT_INTERVAL_SECONDS)
-            await outbox.put(heartbeat_message())
-
-    async def drain_outbox():
-        # The single writer — see this function's own docstring above for
-        # why nothing else calls websocket.send_text() directly.
-        while True:
-            ws_msg = await outbox.get()
-            await websocket.send_text(ws_msg.to_json())
-
-    receiver_task = asyncio.create_task(watch_for_disconnect())
-    streamer_task = asyncio.create_task(stream_events())
-    heartbeat_task = asyncio.create_task(send_heartbeats())
-    sender_task = asyncio.create_task(drain_outbox())
-    tasks = (receiver_task, streamer_task, heartbeat_task, sender_task)
     try:
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        await kafka_consumer.stop()
+        outbox: asyncio.Queue = asyncio.Queue()
+        # Mutable holder (not a bare variable) so both the receiver task
+        # (writes, on a client "subscribe"/"unsubscribe" message) and the
+        # stream task (reads, to decide what to forward) can share it via
+        # closure without a `nonlocal` per task.
+        sub_state = {"flight_id": None}
 
-    for result in results:
-        if isinstance(result, Exception) and not isinstance(
-            result, (WebSocketDisconnect, asyncio.CancelledError)
-        ):
-            print(f"WebSocket handler for {airport_code} exited due to: {result!r}")
+        # SNAPSHOT first: current graph_engine state for this airport, built
+        # fresh per connection rather than cached — matches the old dump-on-
+        # connect behavior, just now typed and batched into one message
+        # instead of one send_text() per flight.
+        snapshot_flights = [
+            attrs["event"].model_dump(mode="json")
+            for _, attrs in graph_engine.graph.nodes(data=True)
+            if attrs.get("event") is not None
+        ]
+        await websocket.send_text(snapshot_message(snapshot_flights).to_json())
+
+        # Bounded history replay for late joiners — see recent_ws_messages'
+        # own comment for why this is a shared buffer, not per-connection.
+        for historical_msg in list(recent_ws_messages):
+            await websocket.send_text(historical_msg.to_json())
+
+        # Each connection gets its own throwaway consumer group so every
+        # connected browser tab sees the full delay-predictions stream
+        # independently — in the same group, multiple consumers *split* the
+        # partitions instead of each seeing everything. auto_offset_reset
+        # "latest": the snapshot+history above already cover current/recent
+        # state, so a newly-connected client doesn't need (and shouldn't get) a
+        # replay of the topic's whole retained history too.
+        group_id = f"{settings.kafka_consumer_group_websocket}-{uuid4()}"
+        kafka_consumer = AIOKafkaConsumer(
+            settings.kafka_topic_delay_predictions,
+            bootstrap_servers=settings.kafka_bootstrap_servers,
+            group_id=group_id,
+            enable_auto_commit=False,
+            auto_offset_reset="latest",
+        )
+        await kafka_consumer.start()
+
+        async def watch_for_disconnect():
+            # Also the only reader of client-sent frames, so this is where an
+            # optional {"action":"subscribe","flight_id":...}/{"action":
+            # "unsubscribe"} message (task 1's "optional: subscribe to a
+            # specific flight_id") gets applied. Malformed/unrecognized frames
+            # are ignored, not fatal — a stray or future-versioned client
+            # message shouldn't kill the connection. receive_text() raising
+            # WebSocketDisconnect the moment the client actually closes is
+            # still what detects a dead client — without a reader at all, a
+            # closed tab is invisible to the server until the next
+            # send_text() happens to fail.
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    msg = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                action = msg.get("action")
+                if action == "subscribe" and msg.get("flight_id"):
+                    sub_state["flight_id"] = msg["flight_id"]
+                elif action == "unsubscribe":
+                    sub_state["flight_id"] = None
+
+        def _passes_filter(ws_msg) -> bool:
+            flight_id = sub_state["flight_id"]
+            if flight_id is None:
+                return True
+            if ws_msg.flight_id == flight_id:
+                return True
+            # A client watching one flight should still see cascades that
+            # originate from it, not just direct updates to it.
+            return ws_msg.data.get("propagation_source") == flight_id
+
+        async def stream_events():
+            # delay-predictions carries PredictionEvent (Phase F); each maps to
+            # exactly one typed WSMessage (Phase G) via classify_prediction_event.
+            async for message in kafka_consumer:
+                prediction = PredictionEvent.from_json(message.value)
+                ws_msg = classify_prediction_event(prediction)
+                recent_ws_messages.append(ws_msg)
+                if _passes_filter(ws_msg):
+                    await outbox.put((time.perf_counter(), ws_msg))
+
+        async def send_heartbeats():
+            # App-level heartbeat, not a raw WS ping/pong frame: the frontend
+            # needs something it can observe through the same onmessage handler
+            # it already has, to detect "socket claims open but nothing — not
+            # even a heartbeat — has arrived in N seconds" without a separate
+            # low-level ping/pong API.
+            while True:
+                await asyncio.sleep(WS_HEARTBEAT_INTERVAL_SECONDS)
+                await outbox.put((time.perf_counter(), heartbeat_message()))
+
+        async def drain_outbox():
+            # The single writer — see this function's own docstring above for
+            # why nothing else calls websocket.send_text() directly.
+            while True:
+                enqueued_at, ws_msg = await outbox.get()
+                websocket_message_latency.observe(time.perf_counter() - enqueued_at)
+                await websocket.send_text(ws_msg.to_json())
+
+        receiver_task = asyncio.create_task(watch_for_disconnect())
+        streamer_task = asyncio.create_task(stream_events())
+        heartbeat_task = asyncio.create_task(send_heartbeats())
+        sender_task = asyncio.create_task(drain_outbox())
+        tasks = (receiver_task, streamer_task, heartbeat_task, sender_task)
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            await kafka_consumer.stop()
+
+        for result in results:
+            if isinstance(result, Exception) and not isinstance(
+                result, (WebSocketDisconnect, asyncio.CancelledError)
+            ):
+                logger.warning(
+                    f"WebSocket handler for {airport_code} exited due to: {result!r}",
+                    extra={"request_id": request_id, "flight_id": airport_code},
+                )
+    finally:
+        active_websocket_connections.dec()
+        logger.info(
+            "WebSocket disconnected",
+            extra={"request_id": request_id, "flight_id": airport_code},
+        )

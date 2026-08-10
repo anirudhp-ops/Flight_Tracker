@@ -9,9 +9,14 @@ bounded by each key's TTL, not by invalidating on every write (see
 flight_tracker/db/DATABASE_DESIGN.md for why that tradeoff was made).
 """
 import json
+import logging
 from typing import Any, Awaitable, Callable, Optional
 
 import redis.asyncio as aioredis
+
+from flight_tracker.metrics import cache_hits, cache_misses
+
+logger = logging.getLogger(__name__)
 
 
 class CacheLayer:
@@ -24,10 +29,12 @@ class CacheLayer:
         raw = await self._redis.get(key)
         if raw is None:
             self.misses += 1
-            print(f"Cache MISS key={key} (hit_rate={self.hit_rate:.1%})")
+            cache_misses.inc()
+            logger.debug(f"Cache miss for {key}", extra={"hit_rate": round(self.hit_rate, 3)})
             return None
         self.hits += 1
-        print(f"Cache HIT  key={key} (hit_rate={self.hit_rate:.1%})")
+        cache_hits.inc()
+        logger.debug(f"Cache hit for {key}", extra={"hit_rate": round(self.hit_rate, 3)})
         return json.loads(raw)
 
     async def set_cached(self, key: str, value: Any, ttl_seconds: int) -> None:

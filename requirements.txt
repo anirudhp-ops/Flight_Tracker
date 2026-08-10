@@ -32,6 +32,15 @@ scikit-learn==1.7.2
 # ml/train.py only (not needed to run the server).
 pandas==3.0.5
 
+# Phase J observability. prometheus_client backs GET /metrics
+# (flight_tracker/metrics/) — a plain client library, no server of its own.
+# python-json-logger is deliberately NOT added here despite being named in
+# the Phase J brief's prose: the brief's own JSONFormatter code (reproduced
+# in flight_tracker/logging_config.py) is a small hand-rolled
+# logging.Formatter subclass with no dependency on that package, so adding
+# it would be an unused import sitting in requirements.txt.
+prometheus_client==0.26.0
+
 # flight_tracker/tests/ only — real tests against live Postgres/Redis/Kafka,
 # no mocks (see the test file's own docstring for why).
 pytest==9.1.1

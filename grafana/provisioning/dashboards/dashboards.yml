@@ -1,0 +1,17 @@
+# Auto-loads every dashboard JSON file docker-compose.yml mounts into
+# /var/lib/grafana/dashboards (currently just grafana_dashboard.json, bind-
+# mounted read-only from flight_tracker/observability/ — see that file's own
+# header for what it covers) so it's already on the "Dashboards" list the
+# first time anyone opens Grafana, rather than requiring a manual import.
+apiVersion: 1
+
+providers:
+  - name: flight-tracker
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

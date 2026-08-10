@@ -1,0 +1,70 @@
+# Prometheus alerting rules (Phase J task 6, optional-for-production).
+# Loaded via prometheus.yml's rule_files. Prometheus only *evaluates* these
+# and exposes firing alerts on its own /alerts page — routing them
+# anywhere (Slack, email, PagerDuty) needs an Alertmanager instance, which
+# this project doesn't run; wiring one up is a real next step, not done
+# here, since it's infrastructure with no consumer yet in this project.
+groups:
+  - name: flight-tracker
+    rules:
+      - alert: BackendDown
+        expr: up{job="flight-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "flight-backend is not responding to Prometheus scrapes"
+          description: "GET /metrics on the backend has failed for 1m — see prometheus.yml's flight-backend job."
+
+      - alert: HighErrorRate
+        # Aggregated across labels deliberately: events_failed_total is
+        # labeled by `reason`, events_processed_total by `worker_id` — two
+        # different label sets that a bare ratio can't join across, so both
+        # sides are summed down to a single series first. The
+        # "and ... > 0" guard avoids firing on 0/0 (no traffic at all,
+        # e.g. right after startup) rather than treating that as 100% failure.
+        expr: |
+          (sum(rate(events_failed_total[5m])) / sum(rate(events_processed_total[5m])))
+          > 0.05
+          and sum(rate(events_processed_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Event failure rate above 5% over the last 5m"
+          description: "{{ $value | humanizePercentage }} of processed events failed — check dead-letter-events (GET /health/dlq) and recent ERROR-level logs."
+
+      - alert: HighConsumerLag
+        # Matches settings.kafka_consumer_lag_warning_threshold's default
+        # (100) — the same number worker_pool.py's own backpressure logic
+        # already treats as "falling behind" (settings.worker_backpressure_lag_threshold
+        # is a stricter, per-worker throttle trigger at 1000; this alert is
+        # the pool-wide early warning).
+        expr: kafka_consumer_lag > 100
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer group {{ $labels.consumer_group }} is falling behind"
+          description: "Lag has been above 100 messages for 2m on consumer group {{ $labels.consumer_group }}."
+
+      - alert: LowCacheHitRate
+        expr: |
+          (sum(rate(cache_hits_total[10m])) / (sum(rate(cache_hits_total[10m])) + sum(rate(cache_misses_total[10m]))))
+          < 0.5
+          and (sum(rate(cache_hits_total[10m])) + sum(rate(cache_misses_total[10m]))) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis cache-aside hit rate below 50% over 10m"
+          description: "Sustained low hit rate usually means TTLs are too short for traffic volume, or Redis was recently flushed/restarted — see flight_tracker/cache/redis_cache.py."
+
+      - alert: HighEventProcessingLatency
+        expr: histogram_quantile(0.95, rate(event_processing_latency_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 event processing latency above 1s over 5m"
+          description: "Check database_query_latency_seconds and propagation_latency_seconds to localize whether the DB, the persistence pool, or DelayPropagationWorker is the bottleneck."

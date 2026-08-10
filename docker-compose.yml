@@ -11,9 +11,17 @@
 # README.md — createdb/createuser flow, `redis-server`). Don't run both at
 # once against the same app instance; config.py only ever points at one.
 #
+# prometheus/grafana (Phase J) scrape and visualize the backend's own
+# GET /metrics — see prometheus.yml's own header for why there's no `kafka`
+# scrape job, and flight_tracker/OBSERVABILITY.md for how to read the
+# dashboard. Neither depends on postgres/redis/kafka above; they only talk
+# to the host-run backend (prometheus.yml targets host.docker.internal:8000).
+#
 # Usage:
 #   docker compose up -d
 #   scripts/create_kafka_topics.sh   # idempotent, safe to re-run
+#   uvicorn flight_tracker.server:app   # backend runs on the host, not here
+#   open http://localhost:3001          # Grafana (admin/admin on first login)
 #   docker compose down              # add -v to also drop the Kafka log volume
 
 services:
@@ -75,7 +83,43 @@ services:
       timeout: 5s
       retries: 5
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: flight-tracker-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./alert_rules.yml:/etc/prometheus/alert_rules.yml
+      - prometheus_data:/prometheus
+    command: --config.file=/etc/prometheus/prometheus.yml
+    # Lets the container resolve host.docker.internal on Linux too (Docker
+    # Desktop on Mac/Windows already provides this out of the box) — needed
+    # for prometheus.yml's flight-backend scrape target to reach the
+    # host-run uvicorn process.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: flight-tracker-grafana
+    ports:
+      # Non-default host port: 3000 is already this project's React dev
+      # server (see README.md's `npm start`).
+      - "3001:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./flight_tracker/observability/grafana_dashboard.json:/var/lib/grafana/dashboards/grafana_dashboard.json:ro
+    depends_on:
+      - prometheus
+
 volumes:
   kafka_data:
   postgres_data:
   redis_data:
+  prometheus_data:
+  grafana_data:

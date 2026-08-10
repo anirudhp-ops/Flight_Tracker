@@ -7,12 +7,19 @@ happens when one dies unexpectedly.
 import asyncio
 
 from flight_tracker.config import settings
+from flight_tracker.metrics import kafka_consumer_lag
 from flight_tracker.workers.worker_pool import Worker, WorkerPool
 
 
 class Supervisor:
-    def __init__(self, pool: WorkerPool):
+    def __init__(self, pool: WorkerPool, consumer_group: str | None = None):
         self.pool = pool
+        # Labels the kafka_consumer_lag gauge below — optional because
+        # tests construct a Supervisor directly around an arbitrary pool
+        # with no real consumer group to report; server.py's two real
+        # supervisors both pass theirs (settings.kafka_consumer_group_worker_pool /
+        # settings.kafka_consumer_group_predictor).
+        self.consumer_group = consumer_group
         self.restarts_per_worker: dict[str, int] = {w.worker_id: 0 for w in pool.workers}
         self.failures_per_worker: dict[str, int] = {w.worker_id: 0 for w in pool.workers}
         self._stopping = False
@@ -114,6 +121,8 @@ class Supervisor:
                 )
                 last_processed = current_processed
                 lag = await self.pool.total_lag()
+                if self.consumer_group is not None:
+                    kafka_consumer_lag.labels(consumer_group=self.consumer_group).set(lag)
                 errors = self.pool.total_events_failed
                 restarts = sum(self.restarts_per_worker.values())
                 print(

@@ -1,5 +1,6 @@
 import asyncpg
 from flight_tracker.config import settings
+from flight_tracker.metrics import database_connection_pool_size, database_query_latency
 from flight_tracker.models.events import FlightEvent, FlightStatus
 
 CREATE_TABLES_SQL = """
@@ -144,40 +145,42 @@ async def write_events(pool, events: list[FlightEvent], airport_code: str | None
             airport_code,
         ))
 
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            await conn.executemany(
-                """
-                INSERT INTO flight_events (
-                    flight_id, flight_key, event_type, airline_code, flight_number,
-                    origin, destination, aircraft_id, gate_id,
-                    scheduled_departure, estimated_departure, actual_departure,
-                    scheduled_arrival, estimated_arrival, actual_arrival,
-                    delay_minutes, status, passenger_count, captured_at
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-                ON CONFLICT (flight_id, captured_at) DO NOTHING
-                """, event_rows,
-            )
-            await conn.executemany(
-                """
-                INSERT INTO active_flights (
-                    flight_key, flight_id, airline_code, flight_number,
-                    origin, destination, aircraft_id, gate_id,
-                    scheduled_departure, scheduled_arrival,
-                    delay_minutes, status, passenger_count, last_updated,
-                    airport_code
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-                ON CONFLICT (flight_key) DO UPDATE SET
-                    flight_id     = EXCLUDED.flight_id,
-                    aircraft_id   = EXCLUDED.aircraft_id,
-                    gate_id       = EXCLUDED.gate_id,
-                    delay_minutes = EXCLUDED.delay_minutes,
-                    status        = EXCLUDED.status,
-                    last_updated  = EXCLUDED.last_updated,
-                    airport_code  = EXCLUDED.airport_code
-                WHERE active_flights.last_updated < EXCLUDED.last_updated
-                """, active_rows,
-            )
+    database_connection_pool_size.set(pool.get_size())
+    with database_query_latency.labels(query_type="write_events").time():
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.executemany(
+                    """
+                    INSERT INTO flight_events (
+                        flight_id, flight_key, event_type, airline_code, flight_number,
+                        origin, destination, aircraft_id, gate_id,
+                        scheduled_departure, estimated_departure, actual_departure,
+                        scheduled_arrival, estimated_arrival, actual_arrival,
+                        delay_minutes, status, passenger_count, captured_at
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                    ON CONFLICT (flight_id, captured_at) DO NOTHING
+                    """, event_rows,
+                )
+                await conn.executemany(
+                    """
+                    INSERT INTO active_flights (
+                        flight_key, flight_id, airline_code, flight_number,
+                        origin, destination, aircraft_id, gate_id,
+                        scheduled_departure, scheduled_arrival,
+                        delay_minutes, status, passenger_count, last_updated,
+                        airport_code
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                    ON CONFLICT (flight_key) DO UPDATE SET
+                        flight_id     = EXCLUDED.flight_id,
+                        aircraft_id   = EXCLUDED.aircraft_id,
+                        gate_id       = EXCLUDED.gate_id,
+                        delay_minutes = EXCLUDED.delay_minutes,
+                        status        = EXCLUDED.status,
+                        last_updated  = EXCLUDED.last_updated,
+                        airport_code  = EXCLUDED.airport_code
+                    WHERE active_flights.last_updated < EXCLUDED.last_updated
+                    """, active_rows,
+                )
     return len(events)
 
 
