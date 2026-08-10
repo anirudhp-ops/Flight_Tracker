@@ -1,0 +1,245 @@
+name: Test
+
+# Runs on every PR (and pushes to main) so a regression is caught before
+# merge, not after — see flight_tracker/TESTING.md for what each job
+# covers and why the coverage thresholds are set where they are.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  backend:
+    name: Backend (pytest)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: flight_tracker
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+      # Single-broker KRaft (no Zookeeper) — same image and config as
+      # docker-compose.yml, which explains why these specific env vars.
+      kafka:
+        image: apache/kafka:4.3.1
+        ports: ["9092:9092"]
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_NUM_PARTITIONS: 3
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 10s --health-timeout 10s --health-retries 10 --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest-cov
+
+      # Kafka's own auto.create.topics.enable defaults to true, so tests
+      # work without this — explicit creation just matches the
+      # partition/retention config scripts/create_kafka_topics.sh gives
+      # developers locally, rather than silently diverging in CI.
+      - name: Create Kafka topics
+        run: |
+          docker exec "$(docker ps -qf ancestor=apache/kafka:4.3.1)" \
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+            --create --if-not-exists --topic flight-events --partitions 3 --replication-factor 1
+          docker exec "$(docker ps -qf ancestor=apache/kafka:4.3.1)" \
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+            --create --if-not-exists --topic processed-flights --partitions 3 --replication-factor 1
+          docker exec "$(docker ps -qf ancestor=apache/kafka:4.3.1)" \
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+            --create --if-not-exists --topic delay-predictions --partitions 3 --replication-factor 1
+          docker exec "$(docker ps -qf ancestor=apache/kafka:4.3.1)" \
+            /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 \
+            --create --if-not-exists --topic dead-letter-events --partitions 1 --replication-factor 1
+
+      - name: Run unit tests with coverage gate
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: flight_tracker
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+          ENABLE_FLIGHTAWARE_API: "false"
+        run: |
+          pytest flight_tracker/tests/ -v --cov --cov-config=.coveragerc \
+            --cov-report=term-missing --cov-report=xml
+
+      - name: Run integration tests
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: flight_tracker
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+          ENABLE_FLIGHTAWARE_API: "false"
+        run: python scripts/integration_tests.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-test-results
+          path: |
+            coverage.xml
+            scripts/integration_test_results.json
+
+  frontend:
+    name: Frontend (Jest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # coverageThreshold in frontend/package.json's "jest" config fails
+      # this step (nonzero exit) if coverage drops below the committed
+      # floor — that IS the "fail if coverage drops" gate, not a separate
+      # check.
+      - name: Run tests with coverage gate
+        working-directory: frontend
+        run: npm test -- --watchAll=false --coverage
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: frontend-coverage
+          path: frontend/coverage
+
+  load-test-baseline:
+    name: Load test (baseline only)
+    runs-on: ubuntu-latest
+    needs: backend
+    # Baseline only, not the full spike test — matches the Phase I brief
+    # ("Run load test (baseline only, not full spike)"): a 60s WebSocket
+    # smoke test belongs on every PR, a 2-minute ramp-to-100-VUs spike
+    # test does not.
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: flight_tracker
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+      kafka:
+        image: apache/kafka:4.3.1
+        ports: ["9092:9092"]
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_NUM_PARTITIONS: 3
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 10s --health-timeout 10s --health-retries 10 --health-start-period 30s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start server
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: postgres
+          DB_PASSWORD: postgres
+          DB_NAME: flight_tracker
+          REDIS_HOST: localhost
+          REDIS_PORT: 6379
+          KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+          ENABLE_FLIGHTAWARE_API: "false"
+        run: |
+          python -m uvicorn flight_tracker.server:app --host 127.0.0.1 --port 8000 --log-level warning &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health/db | grep -q '"redis":"ok"' && exit 0
+            sleep 1
+          done
+          echo "server never became healthy" >&2
+          exit 1
+
+      - name: Install k6
+        run: |
+          curl -sL https://github.com/grafana/k6/releases/latest/download/k6-linux-amd64.tar.gz | tar xz --strip-components 1
+
+      - name: Run k6 baseline scenario only
+        run: |
+          ./k6 run --summary-export=k6_summary.json \
+            -e WS_URL=ws://127.0.0.1:8000 -e SCENARIOS=baseline \
+            scripts/load_test_k6.js
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-baseline-summary
+          path: k6_summary.json
