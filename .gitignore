@@ -5,6 +5,10 @@ ml/model.pkl
 *.pkl
 T_ONTIME_MARKETING.csv
 *.csv
+# Exception: a small (~4k row), real-data sample checked in specifically so
+# CI can train a real ml/model.pkl (also gitignored, above) without the
+# full 34MB/600k-row T_ONTIME_MARKETING.csv — see ml/train.py's docstring.
+!ml/fixtures/*.csv
 
 # Phase I test/benchmark run output — regenerate via the commands in
 # flight_tracker/TESTING.md; flight_tracker/LOAD_TEST_REPORT.md is the

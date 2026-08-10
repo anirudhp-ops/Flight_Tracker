@@ -5,13 +5,29 @@ Usage (from anywhere, run from the repo or not — paths are resolved
 relative to this file, not the current working directory):
 
     python ml/train.py
+    python ml/train.py path/to/other.csv   # optional override, see below
 
 Requires T_ONTIME_MARKETING.csv in the repo root (gitignored — obtain your
 own copy of the BTS On-Time Performance dataset with that name) and writes
 ml/model.pkl, which ml/predictor.py loads at server startup. ml/model.pkl is
 also gitignored, so this must be re-run after every fresh clone before the
 backend can start.
+
+The optional CSV-path argument exists for exactly one caller:
+.github/workflows/test.yml, which has no way to obtain the real 34MB/
+600k-row dataset (also gitignored, and too large to reasonably commit) but
+still needs a real trained model for flight_tracker/tests/test_predictor.py
+and friends — this project's "no mocks" convention (see
+flight_tracker/TESTING.md) rules out faking one. CI instead points this at
+ml/fixtures/ci_sample_ontime.csv, a ~4,000-row real-data sample (same
+columns, same source, just fewer rows — see that file's own generation
+note below) checked into git specifically for this. Every test that needs
+"a real trained model" already derives its expected labels from whatever
+model actually got loaded (`predictor.le_carrier.classes_[0]`, etc. — see
+test_predictor.py's own docstring), not hardcoded IATA/carrier codes, so
+training on this smaller sample doesn't require touching the tests at all.
 """
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -22,7 +38,7 @@ from sklearn.preprocessing import LabelEncoder
 import pickle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CSV_PATH = REPO_ROOT / "T_ONTIME_MARKETING.csv"
+CSV_PATH = Path(sys.argv[1]) if len(sys.argv) > 1 else REPO_ROOT / "T_ONTIME_MARKETING.csv"
 MODEL_PATH = REPO_ROOT / "ml" / "model.pkl"
 
 # ── 1. Load ───────────────────────────────────────────────────────────────────

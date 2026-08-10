@@ -66,6 +66,16 @@ jobs:
           pip install -r requirements.txt
           pip install pytest-cov
 
+      # ml/model.pkl and the full T_ONTIME_MARKETING.csv it's normally
+      # trained from are both gitignored (911MB and 34MB respectively —
+      # see ml/train.py's own docstring for why, and why ml/fixtures/
+      # exists) — a fresh checkout has neither, but
+      # flight_tracker/tests/test_predictor.py and friends load a real
+      # model (this project's "no mocks" convention), so one has to be
+      # trained here before those tests can even import.
+      - name: Train ML model (CI fixture)
+        run: python ml/train.py ml/fixtures/ci_sample_ontime.csv
+
       # Kafka's own auto.create.topics.enable defaults to true, so tests
       # work without this — explicit creation just matches the
       # partition/retention config scripts/create_kafka_topics.sh gives
@@ -207,6 +217,12 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Same reason as the backend job's identical step above: server.py
+      # loads a real ml/model.pkl at import time, which a fresh checkout
+      # doesn't have.
+      - name: Train ML model (CI fixture)
+        run: python ml/train.py ml/fixtures/ci_sample_ontime.csv
 
       - name: Start server
         env:
