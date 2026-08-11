@@ -16,7 +16,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from flight_tracker.cache.redis_cache import CacheLayer
 from flight_tracker.config import settings
 from flight_tracker.db import reader as db_reader
-from flight_tracker.db.writer import create_pool
+from flight_tracker.db.writer import create_pool, ensure_schema
 from flight_tracker.events.dlq_utils import fetch_dlq_events
 from flight_tracker.events.kafka_producer import KafkaEventProducer
 from flight_tracker.graph.engine import GraphEngine
@@ -271,6 +271,12 @@ async def startup():
     global db_pool, worker_task, supervisor, metrics_log_task
     global delay_propagation_supervisor, delay_propagation_metrics_log_task
     db_pool = await create_pool()
+    # CREATE TABLE IF NOT EXISTS — safe to run on every startup. Previously
+    # only test_api.py called this, so the schema only ever existed because
+    # a developer's local Postgres had accumulated it over past runs; a
+    # genuinely fresh database (a new docker-compose volume, RDS, ...) hit
+    # UndefinedTableError here instead.
+    await ensure_schema(db_pool)
     await graph_engine.load_from_db(db_pool, airport_code=settings.target_airport)
     await kafka_producer.start()
 

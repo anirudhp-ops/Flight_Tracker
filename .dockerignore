@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.github/
+
+# Gigantic and/or not needed to build the backend image — see Dockerfile's
+# own comment for why model.pkl is mounted at runtime instead of copied in.
+ml/model.pkl
+T_ONTIME_MARKETING.csv
+*.csv
+!ml/fixtures/*.csv
+
+.env
+.coverage
+htmlcov/
+coverage.xml
+.pytest_cache/
+
+frontend/
+scripts/
+grafana/
+*.md

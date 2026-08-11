@@ -1,0 +1,39 @@
+name: Security
+
+# Dependency vulnerability scan. Runs daily and whenever dependency
+# manifests or backend source change. Non-blocking (|| true) since this
+# is an early-warning scan, not a merge gate — see test.yml for the
+# gate that actually fails PRs.
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  push:
+    paths:
+      - 'flight_tracker/**'
+      - 'requirements.txt'
+      - 'frontend/package-lock.json'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Python dependency scan
+        run: |
+          pip install -r requirements.txt
+          pip install safety
+          safety check --json || true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: JS dependency scan
+        run: cd frontend && npm install && npm audit --production || true

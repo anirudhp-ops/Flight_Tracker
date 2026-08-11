@@ -5,39 +5,56 @@
 # ignored by a KRaft broker or fail outright, so shipping one "because the
 # spec said so" would be worse than deviating and saying why.
 #
-# Postgres and Redis are included per the phase brief ("add to compose for
-# future"), on non-default host ports (5433, 6380) so they don't collide
-# with the native installs this project actually runs against today (see
-# README.md — createdb/createuser flow, `redis-server`). Don't run both at
-# once against the same app instance; config.py only ever points at one.
+# Postgres and Redis are on non-default host ports (5433, 6380) so they
+# don't collide with the native installs this project can also run against
+# (see README.md — createdb/createuser flow, `redis-server`); config.py only
+# ever points at one at a time. The backend/frontend services below always
+# talk to postgres/redis/kafka via their in-network service name and
+# *container* port (5432/6379/29092), never the host-remapped ports above —
+# those remaps only matter for host tools connecting in from outside compose.
+#
+# Kafka has two listeners for exactly that host-vs-container split:
+# PLAINTEXT_HOST (localhost:9092) is what a host-run backend
+# (`uvicorn flight_tracker.server:app`, per README.md) and host tools use;
+# PLAINTEXT (kafka:29092, not published to the host) is what the
+# containerized `backend` service below uses. This was flagged as a TODO in
+# .env.example's KAFKA_BROKER_ADDRESS comment before the backend service
+# existed — this is that follow-through.
 #
 # prometheus/grafana (Phase J) scrape and visualize the backend's own
 # GET /metrics — see prometheus.yml's own header for why there's no `kafka`
 # scrape job, and flight_tracker/OBSERVABILITY.md for how to read the
-# dashboard. Neither depends on postgres/redis/kafka above; they only talk
-# to the host-run backend (prometheus.yml targets host.docker.internal:8000).
+# dashboard. prometheus.yml targets host.docker.internal:8000, which still
+# reaches the backend whether it's running on the host or as the `backend`
+# service below (its 8000 is published to the host either way).
 #
-# Usage:
+# Usage (containerized backend/frontend — needs ml/model.pkl on the host
+# first; `python ml/train.py` if you don't have one):
 #   docker compose up -d
 #   scripts/create_kafka_topics.sh   # idempotent, safe to re-run
-#   uvicorn flight_tracker.server:app   # backend runs on the host, not here
+#   open http://localhost:3000          # frontend (nginx, prod build)
 #   open http://localhost:3001          # Grafana (admin/admin on first login)
 #   docker compose down              # add -v to also drop the Kafka log volume
+#
+# Usage (host-run backend/frontend, unchanged from before this phase):
+#   docker compose up -d postgres redis kafka prometheus grafana
+#   uvicorn flight_tracker.server:app --reload
+#   cd frontend && npm start
 
 services:
   kafka:
     image: apache/kafka:4.3.1
     container_name: flight-tracker-kafka
     ports:
-      - "9092:9092"
+      - "9092:9092"   # PLAINTEXT_HOST only — 29092 (PLAINTEXT) is container-network-internal
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://:29092,PLAINTEXT_HOST://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
@@ -116,6 +133,54 @@ services:
       - ./flight_tracker/observability/grafana_dashboard.json:/var/lib/grafana/dashboards/grafana_dashboard.json:ro
     depends_on:
       - prometheus
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flight-tracker-backend
+    ports:
+      - "8000:8000"
+    # Self-contained: doesn't read .env (that file describes the host-run
+    # setup, where DB/Redis/Kafka are all "localhost"). In-network service
+    # names and container ports instead — see the file header comment.
+    environment:
+      ENABLE_FLIGHTAWARE_API: "false"
+      TARGET_AIRPORT: KJFK
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: flight_tracker
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      # Not baked into the image (see Dockerfile) — must exist on the host
+      # first: `python ml/train.py`.
+      - ./ml/model.pkl:/app/ml/model.pkl:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      # Empty -> the app's own fallback of "http://localhost:8000" (see
+      # frontend/Dockerfile's comment) — correct here since backend's 8000
+      # is published to the host above and the browser runs on the host.
+      args:
+        REACT_APP_BACKEND_URL: ""
+    container_name: flight-tracker-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
 
 volumes:
   kafka_data:
