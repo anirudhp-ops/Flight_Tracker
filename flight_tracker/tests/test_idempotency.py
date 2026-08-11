@@ -18,7 +18,7 @@ import pytest
 import redis.asyncio as aioredis
 
 from flight_tracker.config import settings
-from flight_tracker.db.writer import create_pool, write_events
+from flight_tracker.db.writer import create_pool, ensure_schema, write_events
 from flight_tracker.events.event_model import EventSource, wrap_flight_event
 from flight_tracker.events.kafka_producer import KafkaEventProducer
 from flight_tracker.models.events import EventType, FlightEvent, FlightStatus
@@ -28,6 +28,11 @@ from flight_tracker.workers.event_processor import AsyncEventProcessor
 @pytest.fixture
 async def pool():
     p = await create_pool()
+    # CI's Postgres service container is fresh every run — a local
+    # Postgres normally already has the schema from a prior server.py
+    # startup (ensure_schema() runs there too), which is why this was
+    # only ever caught in CI, not locally.
+    await ensure_schema(p)
     yield p
     await p.close()
 

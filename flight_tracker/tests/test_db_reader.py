@@ -10,13 +10,18 @@ from datetime import datetime, timezone
 import pytest
 
 from flight_tracker.db import reader as db_reader
-from flight_tracker.db.writer import create_pool, write_events
+from flight_tracker.db.writer import create_pool, ensure_schema, write_events
 from flight_tracker.models.events import EventType, FlightEvent, FlightStatus
 
 
 @pytest.fixture
 async def pool():
     p = await create_pool()
+    # CI's Postgres service container is fresh every run — a local
+    # Postgres normally already has the schema from a prior server.py
+    # startup (ensure_schema() runs there too), which is why this was
+    # only ever caught in CI, not locally.
+    await ensure_schema(p)
     yield p
     await p.close()
 
